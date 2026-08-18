@@ -60,6 +60,7 @@ import static org.opensearch.repositories.s3.S3Repository.BUFFER_SIZE_SETTING;
 import static org.opensearch.repositories.s3.S3Repository.BULK_DELETE_SIZE;
 import static org.opensearch.repositories.s3.S3Repository.CANNED_ACL_SETTING;
 import static org.opensearch.repositories.s3.S3Repository.EXPECTED_BUCKET_OWNER_SETTING;
+import static org.opensearch.repositories.s3.S3Repository.MAX_COPY_SIZE_BEFORE_MULTIPART_SETTING;
 import static org.opensearch.repositories.s3.S3Repository.PERMIT_BACKED_TRANSFER_ENABLED;
 import static org.opensearch.repositories.s3.S3Repository.REDIRECT_LARGE_S3_UPLOAD;
 import static org.opensearch.repositories.s3.S3Repository.SERVER_SIDE_ENCRYPTION_BUCKET_KEY_SETTING;
@@ -80,6 +81,7 @@ public class S3BlobStore implements BlobStore {
     private volatile String bucket;
 
     private volatile ByteSizeValue bufferSize;
+    private volatile ByteSizeValue maxCopySizeBeforeMultipart;
 
     private volatile boolean redirectLargeUploads;
 
@@ -151,6 +153,7 @@ public class S3BlobStore implements BlobStore {
         // Settings to initialize blobstore with.
         this.redirectLargeUploads = REDIRECT_LARGE_S3_UPLOAD.get(repositoryMetadata.settings());
         this.uploadRetryEnabled = UPLOAD_RETRY_ENABLED.get(repositoryMetadata.settings());
+        this.maxCopySizeBeforeMultipart = MAX_COPY_SIZE_BEFORE_MULTIPART_SETTING.get(repositoryMetadata.settings());
         this.normalPrioritySizeBasedBlockingQ = normalPrioritySizeBasedBlockingQ;
         this.lowPrioritySizeBasedBlockingQ = lowPrioritySizeBasedBlockingQ;
         this.genericStatsMetricPublisher = genericStatsMetricPublisher;
@@ -167,6 +170,7 @@ public class S3BlobStore implements BlobStore {
         this.repositoryMetadata = repositoryMetadata;
         this.bucket = BUCKET_SETTING.get(repositoryMetadata.settings());
         this.bufferSize = BUFFER_SIZE_SETTING.get(repositoryMetadata.settings());
+        this.maxCopySizeBeforeMultipart = MAX_COPY_SIZE_BEFORE_MULTIPART_SETTING.get(repositoryMetadata.settings());
         this.cannedACL = initCannedACL(CANNED_ACL_SETTING.get(repositoryMetadata.settings()));
         this.storageClass = initStorageClass(STORAGE_CLASS_SETTING.get(repositoryMetadata.settings()));
         this.bulkDeletesSize = BULK_DELETE_SIZE.get(repositoryMetadata.settings());
@@ -240,6 +244,10 @@ public class S3BlobStore implements BlobStore {
      */
     public String expectedBucketOwner() {
         return expectedBucketOwner == null || expectedBucketOwner.isEmpty() ? null : expectedBucketOwner;
+    }
+
+    public long maxCopySizeBeforeMultipart() {
+        return maxCopySizeBeforeMultipart.getBytes();
     }
 
     public long bufferSizeInBytes() {

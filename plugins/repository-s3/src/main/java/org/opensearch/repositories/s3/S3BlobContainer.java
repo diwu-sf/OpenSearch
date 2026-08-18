@@ -35,6 +35,7 @@ package org.opensearch.repositories.s3;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.core.exception.SdkServiceException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
@@ -42,6 +43,7 @@ import software.amazon.awssdk.services.s3.model.CommonPrefix;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectAttributesRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectAttributesResponse;
@@ -53,6 +55,8 @@ import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.ObjectAttributes;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartCopyRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartCopyResponse;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
@@ -98,6 +102,7 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -121,6 +126,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
 
     private static final Logger logger = LogManager.getLogger(S3BlobContainer.class);
     private static final long DEFAULT_OPERATION_TIMEOUT = TimeUnit.SECONDS.toSeconds(30);
+    private static final int HTTP_NOT_FOUND = 404;
 
     private final S3BlobStore blobStore;
     private final String keyPath;
@@ -560,6 +566,162 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
 
     private String buildKey(String blobName) {
         return keyPath + blobName;
+    }
+
+    @Override
+    public boolean isServerSideCopySupported(BlobContainer sourceBlobContainer) {
+        // Sharing an S3BlobStore means sharing the client, credentials and bucket, which is what makes the copy safe to
+        // issue without further validation. Copying across repositories would additionally have to prove that the two
+        // clients address the same endpoint with credentials able to read the source.
+        return sourceBlobContainer instanceof S3BlobContainer && ((S3BlobContainer) sourceBlobContainer).blobStore == blobStore;
+    }
+
+    /**
+     * Performs a server side copy of a blob from a source container.
+     * <p>
+     * S3 can copy an object of any size, but objects larger than 5gb must be copied through a series of part copy
+     * operations rather than a single CopyObject request. See
+     * <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html">CopyObject</a>.
+     * This operation overwrites the destination if it already exists.
+     */
+    @Override
+    public void copyBlob(BlobContainer sourceBlobContainer, String sourceBlobName, String blobName, long blobSize) throws IOException {
+        if (sourceBlobContainer instanceof S3BlobContainer == false) {
+            throw new IllegalArgumentException("source blob container must be a S3BlobContainer");
+        }
+        final S3BlobContainer s3SourceBlobContainer = (S3BlobContainer) sourceBlobContainer;
+
+        try {
+            if (blobSize > blobStore.maxCopySizeBeforeMultipart()) {
+                executeMultipartCopy(s3SourceBlobContainer, sourceBlobName, blobName, blobSize);
+            } else {
+                // Object metadata is inherited from the source, but the canned ACL and storage class are not.
+                final CopyObjectRequest.Builder copyObjectRequestBuilder = CopyObjectRequest.builder()
+                    .sourceBucket(s3SourceBlobContainer.blobStore.bucket())
+                    .sourceKey(s3SourceBlobContainer.buildKey(sourceBlobName))
+                    .expectedSourceBucketOwner(s3SourceBlobContainer.blobStore.expectedBucketOwner())
+                    .destinationBucket(blobStore.bucket())
+                    .destinationKey(buildKey(blobName))
+                    .storageClass(blobStore.getStorageClass())
+                    .acl(blobStore.getCannedACL())
+                    .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().copyObjectMetricPublisher))
+                    .expectedBucketOwner(blobStore.expectedBucketOwner());
+
+                configureEncryptionSettings(copyObjectRequestBuilder, blobStore, null);
+
+                final CopyObjectRequest copyObjectRequest = copyObjectRequestBuilder.build();
+                try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+                    AccessController.doPrivileged(() -> clientReference.get().copyObject(copyObjectRequest));
+                }
+            }
+        } catch (final SdkException e) {
+            if (e instanceof SdkServiceException && ((SdkServiceException) e).statusCode() == HTTP_NOT_FOUND) {
+                throw new NoSuchFileException(
+                    "Copy source [" + s3SourceBlobContainer.buildKey(sourceBlobName) + "] not found: " + e.getMessage()
+                );
+            }
+            throw new IOException("Unable to copy object [" + blobName + "] from [" + sourceBlobContainer + "][" + sourceBlobName + "]", e);
+        }
+    }
+
+    /**
+     * Copies a blob using a multipart copy, required when the blob is larger than
+     * {@link S3BlobStore#maxCopySizeBeforeMultipart()}. Must be called on the destination blob container.
+     * <p>
+     * The copy part size is that same threshold, because that minimises the number of requests needed.
+     */
+    void executeMultipartCopy(
+        final S3BlobContainer sourceContainer,
+        final String sourceBlobName,
+        final String destinationBlobName,
+        final long blobSize
+    ) throws IOException {
+        ensureMultiPartUploadSize(blobSize);
+        final long partSize = blobStore.maxCopySizeBeforeMultipart();
+        final Tuple<Long, Long> multiparts = numberOfMultiparts(blobSize, partSize);
+
+        if (multiparts.v1() > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Too many multipart copy requests, maybe try a larger copy part size?");
+        }
+
+        final int nbParts = multiparts.v1().intValue();
+        final long lastPartSize = multiparts.v2();
+        assert blobSize == (((nbParts - 1) * partSize) + lastPartSize) : "blobSize does not match multipart sizes";
+
+        final String destinationKey = buildKey(destinationBlobName);
+        final String sourceKey = sourceContainer.buildKey(sourceBlobName);
+        final String bucketName = blobStore.bucket();
+        final SetOnce<String> uploadId = new SetOnce<>();
+        boolean success = false;
+
+        final CreateMultipartUploadRequest.Builder createMultipartUploadRequestBuilder = CreateMultipartUploadRequest.builder()
+            .bucket(bucketName)
+            .key(destinationKey)
+            .storageClass(blobStore.getStorageClass())
+            .acl(blobStore.getCannedACL())
+            .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().copyMultipartObjectMetricPublisher))
+            .expectedBucketOwner(blobStore.expectedBucketOwner());
+
+        configureEncryptionSettings(createMultipartUploadRequestBuilder, blobStore, null);
+
+        final CreateMultipartUploadRequest createMultipartUploadRequest = createMultipartUploadRequestBuilder.build();
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            uploadId.set(
+                AccessController.doPrivileged(() -> clientReference.get().createMultipartUpload(createMultipartUploadRequest).uploadId())
+            );
+            if (Strings.isEmpty(uploadId.get())) {
+                throw new IOException("Failed to initialize multipart copy " + destinationBlobName);
+            }
+
+            final List<CompletedPart> parts = new ArrayList<>();
+            for (int i = 1; i <= nbParts; i++) {
+                final long startOffset = (i - 1) * partSize;
+                final long currentPartSize = (i < nbParts) ? partSize : lastPartSize;
+                final UploadPartCopyRequest uploadPartCopyRequest = UploadPartCopyRequest.builder()
+                    .sourceBucket(sourceContainer.blobStore.bucket())
+                    .sourceKey(sourceKey)
+                    .expectedSourceBucketOwner(sourceContainer.blobStore.expectedBucketOwner())
+                    .destinationBucket(bucketName)
+                    .destinationKey(destinationKey)
+                    .uploadId(uploadId.get())
+                    .partNumber(i)
+                    .copySourceRange("bytes=" + startOffset + "-" + (startOffset + currentPartSize - 1))
+                    .overrideConfiguration(
+                        o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().copyMultipartObjectMetricPublisher)
+                    )
+                    .expectedBucketOwner(blobStore.expectedBucketOwner())
+                    .build();
+
+                final UploadPartCopyResponse uploadPartCopyResponse = AccessController.doPrivileged(
+                    () -> clientReference.get().uploadPartCopy(uploadPartCopyRequest)
+                );
+                parts.add(CompletedPart.builder().partNumber(i).eTag(uploadPartCopyResponse.copyPartResult().eTag()).build());
+            }
+
+            final CompleteMultipartUploadRequest completeMultipartUploadRequest = CompleteMultipartUploadRequest.builder()
+                .bucket(bucketName)
+                .key(destinationKey)
+                .uploadId(uploadId.get())
+                .multipartUpload(CompletedMultipartUpload.builder().parts(parts).build())
+                .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().copyMultipartObjectMetricPublisher))
+                .expectedBucketOwner(blobStore.expectedBucketOwner())
+                .build();
+
+            AccessController.doPrivileged(() -> clientReference.get().completeMultipartUpload(completeMultipartUploadRequest));
+            success = true;
+        } finally {
+            if ((success == false) && Strings.hasLength(uploadId.get())) {
+                final AbortMultipartUploadRequest abortRequest = AbortMultipartUploadRequest.builder()
+                    .bucket(bucketName)
+                    .key(destinationKey)
+                    .uploadId(uploadId.get())
+                    .expectedBucketOwner(blobStore.expectedBucketOwner())
+                    .build();
+                try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+                    AccessController.doPrivileged(() -> clientReference.get().abortMultipartUpload(abortRequest));
+                }
+            }
+        }
     }
 
     /**

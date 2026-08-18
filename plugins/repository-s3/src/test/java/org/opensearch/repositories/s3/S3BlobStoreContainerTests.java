@@ -44,6 +44,9 @@ import software.amazon.awssdk.services.s3.model.Checksum;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
+import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
+import software.amazon.awssdk.services.s3.model.CopyPartResult;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
@@ -64,9 +67,12 @@ import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 import software.amazon.awssdk.services.s3.model.S3Error;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 import software.amazon.awssdk.services.s3.model.StorageClass;
+import software.amazon.awssdk.services.s3.model.UploadPartCopyRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartCopyResponse;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
@@ -88,6 +94,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -120,6 +127,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -158,6 +166,168 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
             )
         );
         assertEquals("Upload request size [2097152] can't be larger than buffer size", e.getMessage());
+    }
+
+    public void testIsServerSideCopySupported() {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        final S3BlobStore otherBlobStore = mock(S3BlobStore.class);
+
+        final S3BlobContainer container = new S3BlobContainer(new BlobPath(), blobStore);
+        final S3BlobContainer sameStoreContainer = new S3BlobContainer(new BlobPath().add("other"), blobStore);
+        final S3BlobContainer otherStoreContainer = new S3BlobContainer(new BlobPath(), otherBlobStore);
+
+        assertTrue(container.isServerSideCopySupported(container));
+        assertTrue(container.isServerSideCopySupported(sameStoreContainer));
+        // a different S3BlobStore means a different client/credentials/bucket, so we refuse
+        assertFalse(container.isServerSideCopySupported(otherStoreContainer));
+        // and a non-S3 container is never a valid source
+        assertFalse(container.isServerSideCopySupported(mock(BlobContainer.class)));
+    }
+
+    public void testCopyBlobUsesSingleCopyObjectBelowThreshold() throws IOException {
+        final String bucketName = randomAlphaOfLengthBetween(1, 10);
+        final String sourceBlobName = randomAlphaOfLengthBetween(1, 10);
+        final String blobName = randomAlphaOfLengthBetween(1, 10);
+        final long blobSize = randomLongBetween(1L, ByteSizeUnit.MB.toBytes(1));
+
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn(bucketName);
+        when(blobStore.maxCopySizeBeforeMultipart()).thenReturn(ByteSizeUnit.MB.toBytes(5));
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+        when(blobStore.serverSideEncryptionType()).thenReturn("");
+
+        final S3Client client = mock(S3Client.class);
+        when(client.copyObject(any(CopyObjectRequest.class))).thenReturn(CopyObjectResponse.builder().build());
+        when(blobStore.clientReference()).thenAnswer(invocation -> new AmazonS3Reference(client));
+
+        final S3BlobContainer sourceContainer = new S3BlobContainer(new BlobPath().add("source"), blobStore);
+        final S3BlobContainer targetContainer = new S3BlobContainer(new BlobPath().add("target"), blobStore);
+
+        targetContainer.copyBlob(sourceContainer, sourceBlobName, blobName, blobSize);
+
+        final ArgumentCaptor<CopyObjectRequest> captor = ArgumentCaptor.forClass(CopyObjectRequest.class);
+        verify(client, times(1)).copyObject(captor.capture());
+        verify(client, never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+
+        final CopyObjectRequest request = captor.getValue();
+        assertEquals(bucketName, request.sourceBucket());
+        assertEquals("source/" + sourceBlobName, request.sourceKey());
+        assertEquals(bucketName, request.destinationBucket());
+        assertEquals("target/" + blobName, request.destinationKey());
+    }
+
+    public void testCopyBlobUsesMultipartCopyAboveThreshold() throws IOException {
+        final String bucketName = randomAlphaOfLengthBetween(1, 10);
+        final String sourceBlobName = randomAlphaOfLengthBetween(1, 10);
+        final String blobName = randomAlphaOfLengthBetween(1, 10);
+
+        final long partSize = ByteSizeUnit.MB.toBytes(5);
+        // two full parts plus a remainder, so we can assert the byte ranges of every part
+        final long blobSize = partSize * 2 + 1024L;
+
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn(bucketName);
+        when(blobStore.maxCopySizeBeforeMultipart()).thenReturn(partSize);
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+        when(blobStore.serverSideEncryptionType()).thenReturn("");
+
+        final String uploadId = randomAlphaOfLength(10);
+        final S3Client client = mock(S3Client.class);
+        when(client.createMultipartUpload(any(CreateMultipartUploadRequest.class))).thenReturn(
+            CreateMultipartUploadResponse.builder().uploadId(uploadId).build()
+        );
+        when(client.uploadPartCopy(any(UploadPartCopyRequest.class))).thenReturn(
+            UploadPartCopyResponse.builder().copyPartResult(CopyPartResult.builder().eTag(randomAlphaOfLength(8)).build()).build()
+        );
+        when(client.completeMultipartUpload(any(CompleteMultipartUploadRequest.class))).thenReturn(
+            CompleteMultipartUploadResponse.builder().build()
+        );
+        when(blobStore.clientReference()).thenAnswer(invocation -> new AmazonS3Reference(client));
+
+        final S3BlobContainer sourceContainer = new S3BlobContainer(new BlobPath().add("source"), blobStore);
+        final S3BlobContainer targetContainer = new S3BlobContainer(new BlobPath().add("target"), blobStore);
+
+        targetContainer.copyBlob(sourceContainer, sourceBlobName, blobName, blobSize);
+
+        verify(client, never()).copyObject(any(CopyObjectRequest.class));
+        verify(client, times(1)).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+
+        final ArgumentCaptor<UploadPartCopyRequest> partCaptor = ArgumentCaptor.forClass(UploadPartCopyRequest.class);
+        verify(client, times(3)).uploadPartCopy(partCaptor.capture());
+
+        final List<UploadPartCopyRequest> partRequests = partCaptor.getAllValues();
+        assertEquals("bytes=0-" + (partSize - 1), partRequests.get(0).copySourceRange());
+        assertEquals("bytes=" + partSize + "-" + (2 * partSize - 1), partRequests.get(1).copySourceRange());
+        assertEquals("bytes=" + (2 * partSize) + "-" + (blobSize - 1), partRequests.get(2).copySourceRange());
+        for (int i = 0; i < partRequests.size(); i++) {
+            assertEquals(Integer.valueOf(i + 1), partRequests.get(i).partNumber());
+            assertEquals(uploadId, partRequests.get(i).uploadId());
+            assertEquals("source/" + sourceBlobName, partRequests.get(i).sourceKey());
+            assertEquals("target/" + blobName, partRequests.get(i).destinationKey());
+        }
+
+        // the ranges must cover the blob exactly once, with no gaps or overlaps
+        long covered = 0;
+        for (UploadPartCopyRequest request : partRequests) {
+            final String[] bounds = request.copySourceRange().substring("bytes=".length()).split("-");
+            covered += Long.parseLong(bounds[1]) - Long.parseLong(bounds[0]) + 1;
+        }
+        assertEquals(blobSize, covered);
+
+        verify(client, times(1)).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+        verify(client, never()).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    }
+
+    public void testMultipartCopyAbortsOnFailure() {
+        final String bucketName = randomAlphaOfLengthBetween(1, 10);
+        final long partSize = ByteSizeUnit.MB.toBytes(5);
+        final long blobSize = partSize * 2;
+
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn(bucketName);
+        when(blobStore.maxCopySizeBeforeMultipart()).thenReturn(partSize);
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+        when(blobStore.serverSideEncryptionType()).thenReturn("");
+
+        final S3Client client = mock(S3Client.class);
+        when(client.createMultipartUpload(any(CreateMultipartUploadRequest.class))).thenReturn(
+            CreateMultipartUploadResponse.builder().uploadId(randomAlphaOfLength(10)).build()
+        );
+        when(client.uploadPartCopy(any(UploadPartCopyRequest.class))).thenThrow(SdkException.builder().message("boom").build());
+        when(blobStore.clientReference()).thenAnswer(invocation -> new AmazonS3Reference(client));
+
+        final S3BlobContainer sourceContainer = new S3BlobContainer(new BlobPath().add("source"), blobStore);
+        final S3BlobContainer targetContainer = new S3BlobContainer(new BlobPath().add("target"), blobStore);
+
+        expectThrows(IOException.class, () -> targetContainer.copyBlob(sourceContainer, "source-blob", "target-blob", blobSize));
+
+        verify(client, times(1)).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        verify(client, never()).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+    }
+
+    public void testCopyBlobTranslatesNotFoundToNoSuchFileException() {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn(randomAlphaOfLengthBetween(1, 10));
+        when(blobStore.maxCopySizeBeforeMultipart()).thenReturn(ByteSizeUnit.MB.toBytes(5));
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+        when(blobStore.serverSideEncryptionType()).thenReturn("");
+
+        final S3Client client = mock(S3Client.class);
+        when(client.copyObject(any(CopyObjectRequest.class))).thenThrow(
+            S3Exception.builder().message("no such key").statusCode(404).build()
+        );
+        when(blobStore.clientReference()).thenAnswer(invocation -> new AmazonS3Reference(client));
+
+        final S3BlobContainer sourceContainer = new S3BlobContainer(new BlobPath().add("source"), blobStore);
+        final S3BlobContainer targetContainer = new S3BlobContainer(new BlobPath().add("target"), blobStore);
+
+        expectThrows(NoSuchFileException.class, () -> targetContainer.copyBlob(sourceContainer, "missing", "target-blob", 1024L));
+    }
+
+    public void testCopyBlobRejectsNonS3Source() {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        final S3BlobContainer container = new S3BlobContainer(new BlobPath(), blobStore);
+        expectThrows(IllegalArgumentException.class, () -> container.copyBlob(mock(BlobContainer.class), "source", "target", 1024L));
     }
 
     public void testBlobExists() {

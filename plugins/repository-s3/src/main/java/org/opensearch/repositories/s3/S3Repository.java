@@ -296,6 +296,18 @@ class S3Repository extends MeteredBlobStoreRepository {
     );
 
     /**
+     * Maximum size of a blob that is copied server side with a single CopyObject request. Blobs larger than this are
+     * copied with a multipart copy instead. S3 enforces a 5gb ceiling on non-multipart copies and a 5mb floor on
+     * multipart part sizes. The default is the maximum allowed, which minimises the number of requests.
+     */
+    static final Setting<ByteSizeValue> MAX_COPY_SIZE_BEFORE_MULTIPART_SETTING = Setting.byteSizeSetting(
+        "max_copy_size_before_multipart",
+        MAX_FILE_SIZE,
+        MIN_PART_SIZE_USING_MULTIPART,
+        MAX_FILE_SIZE
+    );
+
+    /**
      * Big files can be broken down into chunks during snapshotting if needed. Defaults to 1g.
      */
     static final Setting<ByteSizeValue> CHUNK_SIZE_SETTING = Setting.byteSizeSetting(

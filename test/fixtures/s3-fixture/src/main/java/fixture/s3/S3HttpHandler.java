@@ -51,6 +51,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HashMap;
@@ -77,6 +78,8 @@ public class S3HttpHandler implements HttpHandler {
 
     private final String bucket;
     private final String path;
+
+    private static final Pattern COPY_SOURCE_RANGE_PATTERN = Pattern.compile("^bytes=(\\d+)-(\\d+)$");
 
     private final ConcurrentMap<String, BytesReference> blobs = new ConcurrentHashMap<>();
 
@@ -116,6 +119,32 @@ public class S3HttpHandler implements HttpHandler {
                 exchange.getResponseHeaders().add("Content-Type", "application/xml");
                 exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
                 exchange.getResponseBody().write(response);
+
+            } else if (Regex.simpleMatch("PUT /" + path + "*?partNumber=*&uploadId=*", request)
+                && exchange.getRequestHeaders().getFirst("x-amz-copy-source") != null) {
+                    // UploadPartCopy: copy a byte range of the source object into a multipart part.
+                    final Map<String, String> params = new HashMap<>();
+                    RestUtils.decodeQueryString(exchange.getRequestURI().getQuery(), 0, params);
+
+                    final String uploadId = params.get("uploadId");
+                    final BytesReference sourceBlob = resolveCopySource(exchange);
+                    if (sourceBlob == null || blobs.containsKey(multipartKey(uploadId, 0)) == false) {
+                        exchange.sendResponseHeaders(RestStatus.NOT_FOUND.getStatus(), -1);
+                    } else {
+                        final int partNumber = Integer.parseInt(params.get("partNumber"));
+                        final BytesReference part = sliceCopySourceRange(
+                            sourceBlob,
+                            exchange.getRequestHeaders().getFirst("x-amz-copy-source-range")
+                        );
+                        blobs.put(multipartKey(uploadId, partNumber), part);
+                        byte[] response = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                            + "<CopyPartResult>\n"
+                            + "  <ETag>" + UUIDs.randomBase64UUID() + "</ETag>\n"
+                            + "</CopyPartResult>").getBytes(StandardCharsets.UTF_8);
+                        exchange.getResponseHeaders().add("Content-Type", "application/xml");
+                        exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
+                        exchange.getResponseBody().write(response);
+                    }
 
             } else if (Regex.simpleMatch("PUT /" + path + "*?partNumber=*&uploadId=*", request)) {
                 final Map<String, String> params = new HashMap<>();
@@ -163,6 +192,23 @@ public class S3HttpHandler implements HttpHandler {
                 exchange.getResponseHeaders().add("Content-Type", "application/xml");
                 exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
                 exchange.getResponseBody().write(response);
+
+            } else if (Regex.simpleMatch("PUT /" + path + "*", request)
+                && exchange.getRequestHeaders().getFirst("x-amz-copy-source") != null) {
+                    // CopyObject: server side copy of a whole object.
+                    final BytesReference sourceBlob = resolveCopySource(exchange);
+                    if (sourceBlob == null) {
+                        exchange.sendResponseHeaders(RestStatus.NOT_FOUND.getStatus(), -1);
+                    } else {
+                        blobs.put(exchange.getRequestURI().toString(), sourceBlob);
+                        byte[] response = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                            + "<CopyObjectResult>\n"
+                            + "  <ETag>" + UUIDs.randomBase64UUID() + "</ETag>\n"
+                            + "</CopyObjectResult>").getBytes(StandardCharsets.UTF_8);
+                        exchange.getResponseHeaders().add("Content-Type", "application/xml");
+                        exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
+                        exchange.getResponseBody().write(response);
+                    }
 
             } else if (Regex.simpleMatch("PUT /" + path + "*", request)) {
                 final Tuple<String, BytesReference> blob = parseRequestBody(exchange);
@@ -289,6 +335,52 @@ public class S3HttpHandler implements HttpHandler {
 
     public Map<String, BytesReference> blobs() {
         return blobs;
+    }
+
+    /**
+     * Resolves the object named by the {@code x-amz-copy-source} header of a CopyObject / UploadPartCopy request.
+     * The header is of the form {@code /bucket/key} (optionally url-encoded), while blobs are keyed by request URI,
+     * so both the bare path and the path with a query string are tried.
+     */
+    private BytesReference resolveCopySource(final HttpExchange exchange) {
+        String source = exchange.getRequestHeaders().getFirst("x-amz-copy-source");
+        if (source == null) {
+            return null;
+        }
+        source = URLDecoder.decode(source, StandardCharsets.UTF_8);
+        if (source.startsWith("/") == false) {
+            source = "/" + source;
+        }
+        final BytesReference exact = blobs.get(source);
+        if (exact != null) {
+            return exact;
+        }
+        // Objects written by a plain PUT are stored under the full request URI, which may carry a query string.
+        for (Map.Entry<String, BytesReference> entry : blobs.entrySet()) {
+            final String key = entry.getKey();
+            final int queryIdx = key.indexOf('?');
+            if (queryIdx > 0 && key.substring(0, queryIdx).equals(source)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Applies an {@code x-amz-copy-source-range} header of the form {@code bytes=start-end} (inclusive) to the source
+     * blob. A null range means the whole blob.
+     */
+    private static BytesReference sliceCopySourceRange(final BytesReference source, final String range) {
+        if (range == null) {
+            return source;
+        }
+        final Matcher matcher = COPY_SOURCE_RANGE_PATTERN.matcher(range);
+        if (matcher.matches() == false) {
+            throw new AssertionError("Unsupported x-amz-copy-source-range [" + range + "]");
+        }
+        final int start = Integer.parseInt(matcher.group(1));
+        final int end = Integer.parseInt(matcher.group(2));
+        return source.slice(start, end - start + 1);
     }
 
     private static String multipartKey(final String uploadId, int partNumber) {

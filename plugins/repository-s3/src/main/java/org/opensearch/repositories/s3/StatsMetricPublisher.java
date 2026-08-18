@@ -189,6 +189,66 @@ public class StatsMetricPublisher {
         public void close() {}
     };
 
+    public MetricPublisher copyObjectMetricPublisher = new MetricPublisher() {
+        @Override
+        public void publish(MetricCollection metricCollection) {
+            LOGGER.debug(() -> "Copy object request metrics: " + metricCollection);
+            for (MetricRecord<?> metricRecord : metricCollection) {
+                switch (metricRecord.metric().name()) {
+                    case "ApiCallDuration":
+                        extendedStats.get(BlobStore.Metric.REQUEST_LATENCY).copyMetrics.addAndGet(
+                            ((Duration) metricRecord.value()).toMillis()
+                        );
+                        break;
+                    case "RetryCount":
+                        extendedStats.get(BlobStore.Metric.RETRY_COUNT).copyMetrics.addAndGet(((Integer) metricRecord.value()));
+                        break;
+                    case "ApiCallSuccessful":
+                        if ((Boolean) metricRecord.value()) {
+                            extendedStats.get(BlobStore.Metric.REQUEST_SUCCESS).copyMetrics.addAndGet(1);
+                        } else {
+                            extendedStats.get(BlobStore.Metric.REQUEST_FAILURE).copyMetrics.addAndGet(1);
+                        }
+                        stats.copyMetrics.addAndGet(1);
+                        break;
+                }
+            }
+        }
+
+        @Override
+        public void close() {}
+    };
+
+    public MetricPublisher copyMultipartObjectMetricPublisher = new MetricPublisher() {
+        @Override
+        public void publish(MetricCollection metricCollection) {
+            LOGGER.debug(() -> "Multi-part copy request metrics: " + metricCollection);
+            for (MetricRecord<?> metricRecord : metricCollection) {
+                switch (metricRecord.metric().name()) {
+                    case "ApiCallDuration":
+                        extendedStats.get(BlobStore.Metric.REQUEST_LATENCY).multiPartCopyMetrics.addAndGet(
+                            ((Duration) metricRecord.value()).toMillis()
+                        );
+                        break;
+                    case "RetryCount":
+                        extendedStats.get(BlobStore.Metric.RETRY_COUNT).multiPartCopyMetrics.addAndGet(((Integer) metricRecord.value()));
+                        break;
+                    case "ApiCallSuccessful":
+                        if ((Boolean) metricRecord.value()) {
+                            extendedStats.get(BlobStore.Metric.REQUEST_SUCCESS).multiPartCopyMetrics.addAndGet(1);
+                        } else {
+                            extendedStats.get(BlobStore.Metric.REQUEST_FAILURE).multiPartCopyMetrics.addAndGet(1);
+                        }
+                        stats.multiPartCopyMetrics.addAndGet(1);
+                        break;
+                }
+            }
+        }
+
+        @Override
+        public void close() {}
+    };
+
     public Stats getStats() {
         return stats;
     }
@@ -209,6 +269,10 @@ public class StatsMetricPublisher {
 
         final AtomicLong multiPartPutMetrics = new AtomicLong();
 
+        final AtomicLong copyMetrics = new AtomicLong();
+
+        final AtomicLong multiPartCopyMetrics = new AtomicLong();
+
         Map<String, Long> toMap() {
             final Map<String, Long> results = new HashMap<>();
             results.put("GetObject", getMetrics.get());
@@ -216,6 +280,8 @@ public class StatsMetricPublisher {
             results.put("PutObject", putMetrics.get());
             results.put("DeleteObjects", deleteMetrics.get());
             results.put("PutMultipartObject", multiPartPutMetrics.get());
+            results.put("CopyObject", copyMetrics.get());
+            results.put("CopyMultipartObject", multiPartCopyMetrics.get());
             return results;
         }
     }
