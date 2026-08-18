@@ -37,6 +37,7 @@ import org.apache.lucene.tests.util.LuceneTestCase;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.io.PathUtils;
 import org.opensearch.common.io.PathUtilsForTesting;
 import org.opensearch.common.io.Streams;
@@ -53,6 +54,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.FileSystem;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileAttribute;
@@ -61,6 +63,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -111,6 +114,161 @@ public class FsBlobContainerTests extends OpenSearchTestCase {
             assertThat(Streams.consumeFully(stream), equalTo(length));
             assertThat(totalBytesRead.get(), equalTo(length));
         }
+    }
+
+    public void testCopyBlobWithinSameContainer() throws IOException {
+        final Path path = PathUtils.get(createTempDir().toString());
+        final FsBlobContainer container = new FsBlobContainer(
+            new FsBlobStore(randomIntBetween(1, 8) * 1024, path, false),
+            BlobPath.cleanPath(),
+            path
+        );
+
+        final String sourceBlobName = randomAlphaOfLengthBetween(1, 20).toLowerCase(Locale.ROOT);
+        final byte[] blobData = randomByteArrayOfLength(randomIntBetween(1, 512));
+        Files.write(path.resolve(sourceBlobName), blobData);
+
+        assertThat(container.isServerSideCopySupported(container), is(true));
+
+        final String targetBlobName = sourceBlobName + "_copy";
+        container.copyBlob(container, sourceBlobName, targetBlobName, blobData.length);
+
+        assertThat(container.blobExists(targetBlobName), is(true));
+        assertArrayEquals(blobData, Files.readAllBytes(path.resolve(targetBlobName)));
+        // the source must be left untouched
+        assertArrayEquals(blobData, Files.readAllBytes(path.resolve(sourceBlobName)));
+        // no temporary blob is left behind
+        assertThat(
+            container.listBlobs().keySet().stream().filter(FsBlobContainer::isTempBlobName).collect(Collectors.toList()),
+            equalTo(Collections.emptyList())
+        );
+    }
+
+    public void testCopyBlobBetweenContainers() throws IOException {
+        final Path sourcePath = PathUtils.get(createTempDir().toString());
+        final Path targetPath = PathUtils.get(createTempDir().toString());
+        final FsBlobContainer sourceContainer = new FsBlobContainer(
+            new FsBlobStore(randomIntBetween(1, 8) * 1024, sourcePath, false),
+            BlobPath.cleanPath(),
+            sourcePath
+        );
+        final FsBlobContainer targetContainer = new FsBlobContainer(
+            new FsBlobStore(randomIntBetween(1, 8) * 1024, targetPath, false),
+            BlobPath.cleanPath(),
+            targetPath
+        );
+
+        final String sourceBlobName = randomAlphaOfLengthBetween(1, 20).toLowerCase(Locale.ROOT);
+        final byte[] blobData = randomByteArrayOfLength(randomIntBetween(1, 512));
+        Files.write(sourcePath.resolve(sourceBlobName), blobData);
+
+        final String targetBlobName = randomAlphaOfLengthBetween(1, 20).toLowerCase(Locale.ROOT);
+        targetContainer.copyBlob(sourceContainer, sourceBlobName, targetBlobName, blobData.length);
+
+        assertArrayEquals(blobData, Files.readAllBytes(targetPath.resolve(targetBlobName)));
+    }
+
+    public void testCopyBlobOverwritesExistingTarget() throws IOException {
+        final Path path = PathUtils.get(createTempDir().toString());
+        final FsBlobContainer container = new FsBlobContainer(
+            new FsBlobStore(randomIntBetween(1, 8) * 1024, path, false),
+            BlobPath.cleanPath(),
+            path
+        );
+
+        final byte[] sourceData = randomByteArrayOfLength(randomIntBetween(1, 512));
+        Files.write(path.resolve("source"), sourceData);
+        Files.write(path.resolve("target"), randomByteArrayOfLength(randomIntBetween(1, 512)));
+
+        container.copyBlob(container, "source", "target", sourceData.length);
+
+        assertArrayEquals(sourceData, Files.readAllBytes(path.resolve("target")));
+    }
+
+    public void testCopyBlobFromMissingSourceThrows() throws IOException {
+        final Path path = PathUtils.get(createTempDir().toString());
+        final FsBlobContainer container = new FsBlobContainer(
+            new FsBlobStore(randomIntBetween(1, 8) * 1024, path, false),
+            BlobPath.cleanPath(),
+            path
+        );
+
+        expectThrows(NoSuchFileException.class, () -> container.copyBlob(container, "missing", "target", 0L));
+        assertThat(container.blobExists("target"), is(false));
+    }
+
+    public void testServerSideCopyUnsupportedForForeignContainer() throws IOException {
+        final Path path = PathUtils.get(createTempDir().toString());
+        final FsBlobContainer container = new FsBlobContainer(
+            new FsBlobStore(randomIntBetween(1, 8) * 1024, path, false),
+            BlobPath.cleanPath(),
+            path
+        );
+
+        // a container that is not an FsBlobContainer cannot be a server side copy source
+        final BlobContainer foreign = new BlobContainer() {
+            @Override
+            public BlobPath path() {
+                return BlobPath.cleanPath();
+            }
+
+            @Override
+            public boolean blobExists(String blobName) {
+                return false;
+            }
+
+            @Override
+            public InputStream readBlob(String blobName) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public InputStream readBlob(String blobName, long position, long length) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public void writeBlobAtomic(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public DeleteResult delete() {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public Map<String, BlobMetadata> listBlobs() {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public Map<String, BlobContainer> children() {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public Map<String, BlobMetadata> listBlobsByPrefix(String blobNamePrefix) {
+                throw new UnsupportedOperationException();
+            }
+        };
+
+        assertThat(container.isServerSideCopySupported(foreign), is(false));
+        expectThrows(IllegalArgumentException.class, () -> container.copyBlob(foreign, "a", "b", 1L));
+
+        // and the default implementation refuses outright
+        assertThat(foreign.isServerSideCopySupported(container), is(false));
+        expectThrows(UnsupportedOperationException.class, () -> foreign.copyBlob(container, "a", "b", 1L));
     }
 
     public void testTempBlobName() {

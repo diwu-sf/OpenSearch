@@ -265,6 +265,47 @@ public interface BlobContainer {
     };
 
     /**
+     * Indicates whether this container is able to copy a blob from {@code sourceBlobContainer} on the
+     * storage service itself, without streaming the bytes through this node.
+     * <p>
+     * Callers must check this before calling {@link #copyBlob}, so that they can fall back to an explicit
+     * read-then-write when server side copy is unavailable. It may be unavailable either because the
+     * implementation has no copy support at all, or because the source container is not backed by the same
+     * store as this one.
+     *
+     * @param sourceBlobContainer The container that would be copied from
+     * @return {@code true} if {@link #copyBlob} can be used with the given source container
+     */
+    @ExperimentalApi
+    default boolean isServerSideCopySupported(BlobContainer sourceBlobContainer) {
+        return false;
+    }
+
+    /**
+     * Copies a blob from {@code sourceBlobContainer} into this container, performing the copy on the storage
+     * service itself where the implementation supports it. If the destination blob already exists, this
+     * operation overwrites it.
+     * <p>
+     * {@link #isServerSideCopySupported(BlobContainer)} must be checked before calling this method.
+     *
+     * @param   sourceBlobContainer
+     *          The container to copy the blob from.
+     * @param   sourceBlobName
+     *          The name of the blob to copy from.
+     * @param   blobName
+     *          The name of the blob to copy to.
+     * @param   blobSize
+     *          The size of the source blob in bytes. This is needed because some object stores use a
+     *          different implementation for very large blobs.
+     * @throws  NoSuchFileException if the source blob does not exist
+     * @throws  IOException if the copy could not be performed
+     */
+    @ExperimentalApi
+    default void copyBlob(BlobContainer sourceBlobContainer, String sourceBlobName, String blobName, long blobSize) throws IOException {
+        throw new UnsupportedOperationException("this blob container does not support server side copy");
+    }
+
+    /**
      * Deletes this container and all its contents from the repository.
      *
      * @return delete result

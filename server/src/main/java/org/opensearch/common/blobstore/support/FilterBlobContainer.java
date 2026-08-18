@@ -137,6 +137,20 @@ public abstract class FilterBlobContainer implements BlobContainer {
     }
 
     @Override
+    public boolean isServerSideCopySupported(BlobContainer sourceBlobContainer) {
+        return sourceBlobContainer instanceof FilterBlobContainer
+            && delegate.isServerSideCopySupported(((FilterBlobContainer) sourceBlobContainer).delegate);
+    }
+
+    @Override
+    public void copyBlob(BlobContainer sourceBlobContainer, String sourceBlobName, String blobName, long blobSize) throws IOException {
+        if (sourceBlobContainer instanceof FilterBlobContainer == false) {
+            throw new IllegalArgumentException("source blob container must be a FilterBlobContainer");
+        }
+        delegate.copyBlob(((FilterBlobContainer) sourceBlobContainer).delegate, sourceBlobName, blobName, blobSize);
+    }
+
+    @Override
     public DeleteResult delete() throws IOException {
         return delegate.delete();
     }

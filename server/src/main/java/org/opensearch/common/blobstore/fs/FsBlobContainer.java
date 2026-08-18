@@ -252,6 +252,40 @@ public class FsBlobContainer extends AbstractBlobContainer {
         IOUtils.fsync(tempBlobPath, false);
     }
 
+    @Override
+    public boolean isServerSideCopySupported(BlobContainer sourceBlobContainer) {
+        return sourceBlobContainer instanceof FsBlobContainer;
+    }
+
+    /**
+     * Copies a blob within the local filesystem. The bytes are copied into a temporary blob first and then atomically
+     * moved into place, so that a concurrent reader never observes a partially written destination blob.
+     */
+    @Override
+    public void copyBlob(BlobContainer sourceBlobContainer, String sourceBlobName, String blobName, long blobSize) throws IOException {
+        if (sourceBlobContainer instanceof FsBlobContainer == false) {
+            throw new IllegalArgumentException("source blob container must be a FsBlobContainer");
+        }
+        final Path sourceBlobPath = ((FsBlobContainer) sourceBlobContainer).path.resolve(sourceBlobName);
+        final String tempBlob = tempBlobName(blobName);
+        final Path tempBlobPath = path.resolve(tempBlob);
+        try {
+            Files.createDirectories(path);
+            Files.copy(sourceBlobPath, tempBlobPath, StandardCopyOption.REPLACE_EXISTING);
+            IOUtils.fsync(tempBlobPath, false);
+            moveBlobAtomic(tempBlob, blobName, false);
+        } catch (IOException ex) {
+            try {
+                deleteBlobsIgnoringIfNotExists(Collections.singletonList(tempBlob));
+            } catch (IOException e) {
+                ex.addSuppressed(e);
+            }
+            throw ex;
+        } finally {
+            IOUtils.fsync(path, true);
+        }
+    }
+
     public void moveBlobAtomic(final String sourceBlobName, final String targetBlobName, final boolean failIfAlreadyExists)
         throws IOException {
         final Path sourceBlobPath = path.resolve(sourceBlobName);

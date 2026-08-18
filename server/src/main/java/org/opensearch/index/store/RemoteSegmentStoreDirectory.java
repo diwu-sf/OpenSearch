@@ -402,6 +402,10 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
             return uploadedFilename;
         }
 
+        public int getWrittenByMajor() {
+            return this.writtenByMajor;
+        }
+
         public void setWrittenByMajor(int writtenByMajor) {
             if (writtenByMajor <= Version.LATEST.major && writtenByMajor >= Version.MIN_SUPPORTED_MAJOR) {
                 this.writtenByMajor = writtenByMajor;
@@ -747,6 +751,55 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     private void postUpload(Directory from, String src, String remoteFilename, String checksum) throws IOException {
         UploadedSegmentMetadata segmentMetadata = new UploadedSegmentMetadata(src, remoteFilename, checksum, from.fileLength(src));
         addUploadedSegment(src, segmentMetadata);
+    }
+
+    /**
+     * Returns the {@link RemoteDirectory} backing the segment data of this directory. Package private because
+     * {@link RemoteDirectory} is not part of the public API surface.
+     */
+    RemoteDirectory getRemoteDataDirectory() {
+        return remoteDataDirectory;
+    }
+
+    /**
+     * Copies a single already-uploaded segment file from {@code source}'s remote store into this directory's remote
+     * store on the storage service itself, without streaming the bytes through this node.
+     * <p>
+     * The uploaded segment metadata of the copied file is derived entirely from the source's metadata entry, so no
+     * local copy of the file is needed. On success the file is registered in this directory exactly as a regular
+     * upload would register it, which is what lets the subsequent refresh listener skip re-uploading it.
+     *
+     * @param source        The remote segment store directory to copy from, already initialized to the commit of interest
+     * @param localFilename The local (Lucene) name of the segment file to copy
+     * @return {@code true} if the file was copied server side, {@code false} if server side copy is unavailable
+     * @throws IOException if server side copy is supported but the copy itself failed
+     */
+    public boolean copySegmentFromRemote(RemoteSegmentStoreDirectory source, String localFilename) throws IOException {
+        final UploadedSegmentMetadata sourceMetadata = source.getSegmentsUploadedToRemoteStore().get(localFilename);
+        if (sourceMetadata == null) {
+            return false;
+        }
+        final String targetRemoteFilename = getNewRemoteSegmentFilename(localFilename);
+        if (remoteDataDirectory.serverSideCopyFrom(
+            source.getRemoteDataDirectory(),
+            sourceMetadata.getUploadedFilename(),
+            targetRemoteFilename,
+            sourceMetadata.getLength()
+        ) == false) {
+            return false;
+        }
+        final UploadedSegmentMetadata copiedMetadata = new UploadedSegmentMetadata(
+            sourceMetadata.getOriginalFilename(),
+            targetRemoteFilename,
+            sourceMetadata.getChecksum(),
+            sourceMetadata.getLength()
+        );
+        // Only propagate a version that was actually recorded; setWrittenByMajor rejects the unset 0 value.
+        if (sourceMetadata.getWrittenByMajor() > 0) {
+            copiedMetadata.setWrittenByMajor(sourceMetadata.getWrittenByMajor());
+        }
+        addUploadedSegment(localFilename, copiedMetadata);
+        return true;
     }
 
     /**

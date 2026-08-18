@@ -220,6 +220,18 @@ public class RemoteStoreSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Controls whether segment files are copied between remote store paths on the storage service itself during
+     * shallow snapshot restore, instead of being uploaded again from the node's local disk. Falls back to the
+     * download-then-upload path automatically when the repository's blob container does not support server side copy.
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_SEGMENT_SERVER_SIDE_COPY_ENABLED = Setting.boolSetting(
+        "cluster.remote_store.segment.server_side_copy.enabled",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     private volatile TimeValue clusterRemoteTranslogBufferInterval;
     private volatile int minRemoteSegmentMetadataFiles;
     private volatile TimeValue clusterRemoteTranslogTransferTimeout;
@@ -235,6 +247,7 @@ public class RemoteStoreSettings {
     private final String translogPathFixedPrefix;
     private final String segmentsPathFixedPrefix;
     private volatile int uploadedSegmentsCleanupThreshold;
+    private volatile boolean isSegmentServerSideCopyEnabled;
 
     public RemoteStoreSettings(Settings settings, ClusterSettings clusterSettings) {
         clusterRemoteTranslogBufferInterval = CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING.get(settings);
@@ -288,6 +301,20 @@ public class RemoteStoreSettings {
             CLUSTER_REMOTE_UPLOADED_SEGMENTS_CLEANUP_THRESHOLD_SETTING,
             this::setUploadedSegmentsCleanupThreshold
         );
+
+        isSegmentServerSideCopyEnabled = CLUSTER_REMOTE_STORE_SEGMENT_SERVER_SIDE_COPY_ENABLED.get(settings);
+        clusterSettings.addSettingsUpdateConsumer(
+            CLUSTER_REMOTE_STORE_SEGMENT_SERVER_SIDE_COPY_ENABLED,
+            this::setSegmentServerSideCopyEnabled
+        );
+    }
+
+    public boolean isSegmentServerSideCopyEnabled() {
+        return isSegmentServerSideCopyEnabled;
+    }
+
+    private void setSegmentServerSideCopyEnabled(boolean isSegmentServerSideCopyEnabled) {
+        this.isSegmentServerSideCopyEnabled = isSegmentServerSideCopyEnabled;
     }
 
     public TimeValue getClusterRemoteTranslogBufferInterval() {

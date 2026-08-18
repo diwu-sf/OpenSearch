@@ -875,6 +875,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX,
                 // Server Side encryption enabled
                 RemoteStoreSettings.CLUSTER_SERVER_SIDE_ENCRYPTION_ENABLED,
+                RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_SERVER_SIDE_COPY_ENABLED,
 
                 // Snapshot related Settings
                 BlobStoreRepository.SNAPSHOT_SHARD_PATH_PREFIX_SETTING,

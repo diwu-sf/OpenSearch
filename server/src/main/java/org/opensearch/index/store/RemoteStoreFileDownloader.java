@@ -9,6 +9,7 @@
 package org.opensearch.index.store;
 
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.opensearch.action.support.GroupedActionListener;
@@ -19,6 +20,7 @@ import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.indices.recovery.RecoverySettings;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -40,11 +42,23 @@ public final class RemoteStoreFileDownloader {
     private final Logger logger;
     private final ThreadPool threadPool;
     private final RecoverySettings recoverySettings;
+    @Nullable
+    private final RemoteStoreSettings remoteStoreSettings;
 
     public RemoteStoreFileDownloader(ShardId shardId, ThreadPool threadPool, RecoverySettings recoverySettings) {
+        this(shardId, threadPool, recoverySettings, null);
+    }
+
+    public RemoteStoreFileDownloader(
+        ShardId shardId,
+        ThreadPool threadPool,
+        RecoverySettings recoverySettings,
+        @Nullable RemoteStoreSettings remoteStoreSettings
+    ) {
         this.logger = Loggers.getLogger(RemoteStoreFileDownloader.class, shardId);
         this.threadPool = threadPool;
         this.recoverySettings = recoverySettings;
+        this.remoteStoreSettings = remoteStoreSettings;
     }
 
     /**
@@ -148,10 +162,13 @@ public final class RemoteStoreFileDownloader {
                 logger.trace("Downloading file {}", file);
                 try {
                     cancellableThreads.executeIO(() -> {
+                        // Attempt the remote-to-remote copy first: it needs no local bytes, so when it succeeds the
+                        // upload leg below is skipped entirely and the file only travels once, into the local store.
+                        final boolean serverSideCopied = maybeServerSideCopy(source, secondDestination, file);
                         destination.copyFrom(source, file, file, IOContext.DEFAULT);
                         logger.trace("Downloaded file {} of size {}", file, destination.fileLength(file));
                         onFileCompletion.run();
-                        if (secondDestination != null) {
+                        if (secondDestination != null && serverSideCopied == false) {
                             secondDestination.copyFrom(destination, file, file, IOContext.DEFAULT);
                         }
                     });
@@ -165,4 +182,38 @@ public final class RemoteStoreFileDownloader {
             });
         }
     }
+
+    /**
+     * Tries to copy {@code file} from {@code source}'s remote store straight into {@code secondDestination}'s remote
+     * store on the storage service itself, so that the bytes never have to be uploaded back from this node.
+     * <p>
+     * This never throws: any reason the copy cannot happen -- the feature being disabled, either side not being a
+     * {@link RemoteSegmentStoreDirectory}, the repository's blob container having no server side copy support, or the
+     * copy itself failing -- results in {@code false} and leaves the caller on the existing download-then-upload path.
+     *
+     * @return {@code true} if the file now exists in {@code secondDestination}'s remote store
+     */
+    private boolean maybeServerSideCopy(Directory source, @Nullable Directory secondDestination, String file) {
+        if (secondDestination == null
+            || remoteStoreSettings == null
+            || remoteStoreSettings.isSegmentServerSideCopyEnabled() == false
+            || source instanceof RemoteSegmentStoreDirectory == false
+            || secondDestination instanceof RemoteSegmentStoreDirectory == false) {
+            return false;
+        }
+        try {
+            final boolean copied = ((RemoteSegmentStoreDirectory) secondDestination).copySegmentFromRemote(
+                (RemoteSegmentStoreDirectory) source,
+                file
+            );
+            if (copied) {
+                logger.trace("Server side copied file {} between remote stores", file);
+            }
+            return copied;
+        } catch (Exception e) {
+            logger.warn(() -> new ParameterizedMessage("Server side copy failed for file [{}], falling back to upload", file), e);
+            return false;
+        }
+    }
+
 }

@@ -25,6 +25,10 @@ import org.apache.lucene.util.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.AsyncMultiStreamBlobContainer;
+import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.fs.FsBlobContainer;
+import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.blobstore.stream.write.WriteContext;
 import org.opensearch.common.io.VersionedCodecStreamWrapper;
 import org.opensearch.common.io.stream.BytesStreamOutput;
@@ -52,6 +56,7 @@ import org.junit.Before;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -596,6 +601,112 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
         remoteSegmentStoreDirectory.copyFrom(storeDirectory, filename, IOContext.DEFAULT, completionListener, false, null);
         assertTrue(latch.await(5000, TimeUnit.SECONDS));
         assertFalse(remoteSegmentStoreDirectory.getSegmentsUploadedToRemoteStore().containsKey(filename));
+
+        storeDirectory.close();
+    }
+
+    /**
+     * Builds a RemoteSegmentStoreDirectory whose data directory is backed by a real local-filesystem blob container,
+     * so that the whole server side copy chain (RemoteSegmentStoreDirectory -> RemoteDirectory -> BlobContainer) runs
+     * for real rather than against a mock.
+     */
+    private RemoteSegmentStoreDirectory newFsBackedDirectory(FsBlobStore blobStore, java.nio.file.Path path) throws IOException {
+        final FsBlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), path);
+        return new RemoteSegmentStoreDirectory(
+            new RemoteDirectory(blobContainer),
+            remoteMetadataDirectory,
+            mdLockManager,
+            threadPool,
+            indexShard.shardId(),
+            new HashMap<>()
+        );
+    }
+
+    public void testCopySegmentFromRemoteCopiesBytesAndRegistersMetadata() throws Exception {
+        final java.nio.file.Path sourcePath = createTempDir();
+        final java.nio.file.Path targetPath = createTempDir();
+        final FsBlobStore sourceBlobStore = new FsBlobStore(1024, sourcePath, false);
+        final FsBlobStore targetBlobStore = new FsBlobStore(1024, targetPath, false);
+
+        final RemoteSegmentStoreDirectory sourceDirectory = newFsBackedDirectory(sourceBlobStore, sourcePath);
+        final RemoteSegmentStoreDirectory targetDirectory = newFsBackedDirectory(targetBlobStore, targetPath);
+
+        // Put a segment file into the source's remote store the normal way, so that its uploaded metadata is populated.
+        final String filename = "_100.si";
+        final Directory storeDirectory = LuceneTestCase.newDirectory();
+        try (IndexOutput indexOutput = storeDirectory.createOutput(filename, IOContext.DEFAULT)) {
+            indexOutput.writeString("Hello World!");
+            CodecUtil.writeFooter(indexOutput);
+        }
+        storeDirectory.sync(List.of(filename));
+        sourceDirectory.copyFrom(storeDirectory, filename, filename, IOContext.DEFAULT);
+
+        final RemoteSegmentStoreDirectory.UploadedSegmentMetadata sourceMetadata = sourceDirectory.getSegmentsUploadedToRemoteStore()
+            .get(filename);
+        assertNotNull(sourceMetadata);
+
+        // The target has never seen this file.
+        assertFalse(targetDirectory.getSegmentsUploadedToRemoteStore().containsKey(filename));
+
+        assertTrue(targetDirectory.copySegmentFromRemote(sourceDirectory, filename));
+
+        final RemoteSegmentStoreDirectory.UploadedSegmentMetadata copied = targetDirectory.getSegmentsUploadedToRemoteStore().get(filename);
+        assertNotNull(copied);
+        // Checksum and length are carried over from the source entry rather than recomputed from a local file.
+        assertEquals(sourceMetadata.getChecksum(), copied.getChecksum());
+        assertEquals(sourceMetadata.getLength(), copied.getLength());
+        assertEquals(sourceMetadata.getOriginalFilename(), copied.getOriginalFilename());
+        // The blob name is freshly generated for the target, so the two remote stores do not alias one another.
+        assertNotEquals(sourceMetadata.getUploadedFilename(), copied.getUploadedFilename());
+        assertTrue(copied.getUploadedFilename().startsWith(filename + "__"));
+
+        // The bytes really landed in the target blob store, and match the source byte for byte.
+        assertArrayEquals(
+            Files.readAllBytes(sourcePath.resolve(sourceMetadata.getUploadedFilename())),
+            Files.readAllBytes(targetPath.resolve(copied.getUploadedFilename()))
+        );
+
+        // And the target now reports it holds the file, which is what makes the refresh listener skip re-uploading it.
+        assertTrue(targetDirectory.containsFile(filename, sourceMetadata.getChecksum()));
+
+        storeDirectory.close();
+    }
+
+    public void testCopySegmentFromRemoteReturnsFalseForUnknownFile() throws Exception {
+        final java.nio.file.Path sourcePath = createTempDir();
+        final java.nio.file.Path targetPath = createTempDir();
+        final RemoteSegmentStoreDirectory sourceDirectory = newFsBackedDirectory(new FsBlobStore(1024, sourcePath, false), sourcePath);
+        final RemoteSegmentStoreDirectory targetDirectory = newFsBackedDirectory(new FsBlobStore(1024, targetPath, false), targetPath);
+
+        assertFalse(targetDirectory.copySegmentFromRemote(sourceDirectory, "_does_not_exist.si"));
+        assertTrue(targetDirectory.getSegmentsUploadedToRemoteStore().isEmpty());
+    }
+
+    public void testCopySegmentFromRemoteReturnsFalseWhenContainerHasNoCopySupport() throws Exception {
+        final java.nio.file.Path sourcePath = createTempDir();
+        final RemoteSegmentStoreDirectory sourceDirectory = newFsBackedDirectory(new FsBlobStore(1024, sourcePath, false), sourcePath);
+
+        final String filename = "_100.si";
+        final Directory storeDirectory = LuceneTestCase.newDirectory();
+        try (IndexOutput indexOutput = storeDirectory.createOutput(filename, IOContext.DEFAULT)) {
+            indexOutput.writeString("Hello World!");
+            CodecUtil.writeFooter(indexOutput);
+        }
+        storeDirectory.sync(List.of(filename));
+        sourceDirectory.copyFrom(storeDirectory, filename, filename, IOContext.DEFAULT);
+
+        // A target whose blob container does not implement server side copy must fall back rather than fail.
+        final RemoteSegmentStoreDirectory targetDirectory = new RemoteSegmentStoreDirectory(
+            new RemoteDirectory(mock(BlobContainer.class)),
+            remoteMetadataDirectory,
+            mdLockManager,
+            threadPool,
+            indexShard.shardId(),
+            new HashMap<>()
+        );
+
+        assertFalse(targetDirectory.copySegmentFromRemote(sourceDirectory, filename));
+        assertFalse(targetDirectory.getSegmentsUploadedToRemoteStore().containsKey(filename));
 
         storeDirectory.close();
     }

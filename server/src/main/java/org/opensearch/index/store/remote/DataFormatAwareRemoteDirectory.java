@@ -213,6 +213,17 @@ public class DataFormatAwareRemoteDirectory extends RemoteDirectory {
     // ═══════════════════════════════════════════════════════════════
 
     /**
+     * Server side copy is not yet supported for data-format-aware directories: blobs are routed to a different
+     * {@link org.opensearch.common.blobstore.BlobContainer} per data format, so a correct implementation has to
+     * resolve the format on both the source and the target side. Returning {@code false} keeps these indices on
+     * the existing download-then-upload path.
+     */
+    @Override
+    public boolean serverSideCopyFrom(RemoteDirectory source, String sourceBlobName, String targetBlobName, long blobSize) {
+        return false;
+    }
+
+    /**
      * Sync copyFrom override that properly handles format-aware local files.
      *
      * <p>When AsyncMultiStreamBlobContainer is not available (e.g., FS-based blob store in tests),

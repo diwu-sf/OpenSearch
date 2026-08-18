@@ -409,6 +409,29 @@ public class RemoteDirectory extends Directory {
         return false;
     }
 
+    /**
+     * Copies a blob from {@code source} into this directory on the storage service itself, without streaming the
+     * bytes through this node. This is only possible when both directories are backed by the same store and that
+     * store implements {@link BlobContainer#copyBlob}; callers must handle the {@code false} return by falling back
+     * to an explicit download and upload.
+     *
+     * @param source          The remote directory holding the blob to copy
+     * @param sourceBlobName  The name of the blob in {@code source}
+     * @param targetBlobName  The name to give the blob in this directory
+     * @param blobSize        The size of the source blob in bytes
+     * @return {@code true} if the blob was copied server side, {@code false} if server side copy is unavailable
+     * @throws IOException if server side copy is supported but the copy itself failed
+     */
+    public boolean serverSideCopyFrom(RemoteDirectory source, String sourceBlobName, String targetBlobName, long blobSize)
+        throws IOException {
+        final BlobContainer sourceBlobContainer = source.getBlobContainer();
+        if (blobContainer.isServerSideCopySupported(sourceBlobContainer) == false) {
+            return false;
+        }
+        blobContainer.copyBlob(sourceBlobContainer, sourceBlobName, targetBlobName, blobSize);
+        return true;
+    }
+
     protected void uploadBlob(
         Directory from,
         String src,

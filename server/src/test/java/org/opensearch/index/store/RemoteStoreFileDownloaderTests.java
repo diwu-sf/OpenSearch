@@ -8,6 +8,7 @@
 
 package org.opensearch.index.store;
 
+import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.IOContext;
@@ -16,12 +17,18 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.action.support.PlainActionFuture;
+import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.fs.FsBlobContainer;
+import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.store.lockmanager.RemoteStoreMetadataLockManager;
+import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.indices.recovery.RecoverySettings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
@@ -32,8 +39,10 @@ import org.junit.Before;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -41,6 +50,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+
+import static org.mockito.Mockito.mock;
 
 public class RemoteStoreFileDownloaderTests extends OpenSearchTestCase {
 
@@ -101,6 +112,167 @@ public class RemoteStoreFileDownloaderTests extends OpenSearchTestCase {
         fileDownloader.download(source, destination, null, files.keySet(), counter::incrementAndGet);
         assertContent(files, destination);
         assertEquals(files.size(), counter.get());
+    }
+
+    /**
+     * A blob container that records how many blobs were written byte-by-byte versus copied on the "server" side, so a
+     * test can tell which of the two paths the downloader actually took.
+     */
+    private static class CountingFsBlobContainer extends FsBlobContainer {
+        final AtomicInteger writeBlobCount = new AtomicInteger();
+        final AtomicInteger copyBlobCount = new AtomicInteger();
+
+        CountingFsBlobContainer(FsBlobStore blobStore, BlobPath blobPath, Path path) {
+            super(blobStore, blobPath, path);
+        }
+
+        @Override
+        public void writeBlob(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws IOException {
+            writeBlobCount.incrementAndGet();
+            super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public void copyBlob(BlobContainer sourceBlobContainer, String sourceBlobName, String blobName, long blobSize) throws IOException {
+            copyBlobCount.incrementAndGet();
+            super.copyBlob(sourceBlobContainer, sourceBlobName, blobName, blobSize);
+        }
+    }
+
+    private RemoteSegmentStoreDirectory newRemoteSegmentStoreDirectory(BlobContainer blobContainer) throws IOException {
+        return new RemoteSegmentStoreDirectory(
+            new RemoteDirectory(blobContainer),
+            mock(RemoteDirectory.class),
+            mock(RemoteStoreMetadataLockManager.class),
+            threadPool,
+            ShardId.fromString("[RemoteStoreFileDownloaderTests][0]"),
+            new HashMap<>()
+        );
+    }
+
+    private RemoteStoreSettings remoteStoreSettings(boolean serverSideCopyEnabled) {
+        return new RemoteStoreSettings(
+            Settings.builder()
+                .put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENT_SERVER_SIDE_COPY_ENABLED.getKey(), serverSideCopyEnabled)
+                .build(),
+            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
+        );
+    }
+
+    /**
+     * Writes a handful of well-formed Lucene files (the remote segment store computes a codec checksum on upload, so
+     * they need a real footer) into a fresh local directory and seeds a remote segment store directory from them.
+     */
+    private Set<String> seedSourceRemoteDirectory(Directory localSource, RemoteSegmentStoreDirectory sourceRemote) throws IOException {
+        final Set<String> filenames = new HashSet<>();
+        for (int i = 0; i < 5; i++) {
+            final String filename = "_" + i + ".si";
+            try (IndexOutput output = localSource.createOutput(filename, IOContext.DEFAULT)) {
+                output.writeString("segment content " + randomAlphaOfLength(20));
+                CodecUtil.writeFooter(output);
+            }
+            localSource.sync(Set.of(filename));
+            sourceRemote.copyFrom(localSource, filename, filename, IOContext.DEFAULT);
+            filenames.add(filename);
+        }
+        return filenames;
+    }
+
+    private void assertSameContent(Directory expected, Directory actual, Set<String> filenames) throws IOException {
+        for (String filename : filenames) {
+            assertEquals(expected.fileLength(filename), actual.fileLength(filename));
+            final byte[] expectedBytes = new byte[(int) expected.fileLength(filename)];
+            final byte[] actualBytes = new byte[expectedBytes.length];
+            try (IndexInput in = expected.openInput(filename, IOContext.DEFAULT)) {
+                in.readBytes(expectedBytes, 0, expectedBytes.length);
+            }
+            try (IndexInput in = actual.openInput(filename, IOContext.DEFAULT)) {
+                in.readBytes(actualBytes, 0, actualBytes.length);
+            }
+            assertArrayEquals(expectedBytes, actualBytes);
+        }
+    }
+
+    public void testServerSideCopySkipsUploadLeg() throws Exception {
+        final Path sourceBlobPath = createTempDir();
+        final Path targetBlobPath = createTempDir();
+        final CountingFsBlobContainer sourceContainer = new CountingFsBlobContainer(
+            new FsBlobStore(1024, sourceBlobPath, false),
+            BlobPath.cleanPath(),
+            sourceBlobPath
+        );
+        final CountingFsBlobContainer targetContainer = new CountingFsBlobContainer(
+            new FsBlobStore(1024, targetBlobPath, false),
+            BlobPath.cleanPath(),
+            targetBlobPath
+        );
+
+        final Directory localSource = new NIOFSDirectory(createTempDir());
+        final RemoteSegmentStoreDirectory sourceRemote = newRemoteSegmentStoreDirectory(sourceContainer);
+        final Set<String> filenames = seedSourceRemoteDirectory(localSource, sourceRemote);
+        final RemoteSegmentStoreDirectory targetRemote = newRemoteSegmentStoreDirectory(targetContainer);
+        targetContainer.writeBlobCount.set(0);
+
+        final RemoteStoreFileDownloader downloader = new RemoteStoreFileDownloader(
+            ShardId.fromString("[RemoteStoreFileDownloaderTests][0]"),
+            threadPool,
+            new RecoverySettings(Settings.EMPTY, new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)),
+            remoteStoreSettings(true)
+        );
+
+        downloader.download(sourceRemote, destination, targetRemote, filenames, () -> {});
+
+        // The local store is still populated, because the engine needs it to open.
+        assertSameContent(localSource, destination, filenames);
+        // Every file was copied on the "server" side and none was uploaded back from local disk.
+        assertEquals(filenames.size(), targetContainer.copyBlobCount.get());
+        assertEquals(0, targetContainer.writeBlobCount.get());
+        // And the target directory knows about all of them, with the source's checksums.
+        for (String filename : filenames) {
+            assertEquals(
+                sourceRemote.getSegmentsUploadedToRemoteStore().get(filename).getChecksum(),
+                targetRemote.getSegmentsUploadedToRemoteStore().get(filename).getChecksum()
+            );
+        }
+    }
+
+    public void testUploadLegStillRunsWhenServerSideCopyDisabled() throws Exception {
+        final Path sourceBlobPath = createTempDir();
+        final Path targetBlobPath = createTempDir();
+        final CountingFsBlobContainer sourceContainer = new CountingFsBlobContainer(
+            new FsBlobStore(1024, sourceBlobPath, false),
+            BlobPath.cleanPath(),
+            sourceBlobPath
+        );
+        final CountingFsBlobContainer targetContainer = new CountingFsBlobContainer(
+            new FsBlobStore(1024, targetBlobPath, false),
+            BlobPath.cleanPath(),
+            targetBlobPath
+        );
+
+        final Directory localSource = new NIOFSDirectory(createTempDir());
+        final RemoteSegmentStoreDirectory sourceRemote = newRemoteSegmentStoreDirectory(sourceContainer);
+        final Set<String> filenames = seedSourceRemoteDirectory(localSource, sourceRemote);
+        final RemoteSegmentStoreDirectory targetRemote = newRemoteSegmentStoreDirectory(targetContainer);
+        targetContainer.writeBlobCount.set(0);
+
+        final RemoteStoreFileDownloader downloader = new RemoteStoreFileDownloader(
+            ShardId.fromString("[RemoteStoreFileDownloaderTests][0]"),
+            threadPool,
+            new RecoverySettings(Settings.EMPTY, new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)),
+            remoteStoreSettings(false)
+        );
+
+        downloader.download(sourceRemote, destination, targetRemote, filenames, () -> {});
+
+        assertSameContent(localSource, destination, filenames);
+        // With the optimization off we get exactly the old behaviour: upload from local, no server side copy.
+        assertEquals(0, targetContainer.copyBlobCount.get());
+        assertEquals(filenames.size(), targetContainer.writeBlobCount.get());
+        for (String filename : filenames) {
+            assertTrue(targetRemote.getSegmentsUploadedToRemoteStore().containsKey(filename));
+        }
     }
 
     public void testDownloadNonExistentFile() throws InterruptedException {

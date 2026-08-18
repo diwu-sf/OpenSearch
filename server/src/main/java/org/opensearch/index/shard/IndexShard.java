@@ -573,7 +573,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.remoteStoreStatsTrackerFactory = remoteStoreStatsTrackerFactory;
         this.recoverySettings = recoverySettings;
         this.remoteStoreSettings = remoteStoreSettings;
-        this.fileDownloader = new RemoteStoreFileDownloader(shardRouting.shardId(), threadPool, recoverySettings);
+        this.fileDownloader = new RemoteStoreFileDownloader(shardRouting.shardId(), threadPool, recoverySettings, remoteStoreSettings);
         this.shardMigrationState = getShardMigrationState(indexSettings, seedRemote);
         this.discoveryNodes = discoveryNodes;
         this.segmentReplicationStatsProvider = segmentReplicationStatsProvider;
