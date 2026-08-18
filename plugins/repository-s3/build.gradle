@@ -50,6 +50,8 @@ dependencies {
   // aws sdk v2 stack
   api "software.amazon.awssdk:sdk-core:${versions.aws}"
   api "software.amazon.awssdk:annotations:${versions.aws}"
+  // required by S3Client#copyObject / uploadPartCopy, which resolve the copy source through S3ArnUtils
+  api "software.amazon.awssdk:arns:${versions.aws}"
   api "software.amazon.awssdk:aws-core:${versions.aws}"
   api "software.amazon.awssdk:auth:${versions.aws}"
   api "software.amazon.awssdk:identity-spi:${versions.aws}"
@@ -525,8 +527,6 @@ thirdPartyAudit {
     'org.graalvm.nativeimage.hosted.Feature',
     'org.graalvm.nativeimage.hosted.Feature$AfterImageWriteAccess',
 
-    'software.amazon.awssdk.arns.Arn',
-    'software.amazon.awssdk.arns.ArnResource',
     'software.amazon.eventstream.HeaderValue',
     'software.amazon.eventstream.Message',
     'software.amazon.eventstream.MessageDecoder',

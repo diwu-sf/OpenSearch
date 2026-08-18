@@ -379,11 +379,17 @@ public class S3BlobStoreRepositoryTests extends OpenSearchMockAPIBasedRepository
                 trackRequest("GetObject");
             } else if (isMultiPartUpload(request)) {
                 trackRequest("PutMultipartObject");
+            } else if (isServerSideCopy(request, requestHeaders)) {
+                trackRequest("CopyObject");
             } else if (Regex.simpleMatch("PUT /*/*", request)) {
                 trackRequest("PutObject");
             } else if (Regex.simpleMatch("POST /*?delete*", request)) {
                 trackRequest("DeleteObjects");
             }
+        }
+
+        private boolean isServerSideCopy(String request, Headers requestHeaders) {
+            return Regex.simpleMatch("PUT /*/*", request) && requestHeaders.getFirst("x-amz-copy-source") != null;
         }
 
         private boolean isMultiPartUpload(String request) {

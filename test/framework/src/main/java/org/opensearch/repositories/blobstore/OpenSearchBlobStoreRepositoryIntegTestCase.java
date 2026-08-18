@@ -148,7 +148,14 @@ public abstract class OpenSearchBlobStoreRepositoryIntegTestCase extends OpenSea
                 data = randomBytes(randomIntBetween(10, scaledRandomIntBetween(1024, 1 << 16)));
                 writeBlob(container, "foobar", new BytesArray(data), false);
             }
-            try (InputStream stream = container.readBlob("foobar")) {
+            String readBlobName = "foobar";
+            if (container.isServerSideCopySupported(container)) {
+                // Exercise the server side copy path where the repository implementation offers one, and read the copy
+                // back instead of the original so that the copied bytes are verified below.
+                readBlobName = "foobar_copy";
+                container.copyBlob(container, "foobar", readBlobName, data.length);
+            }
+            try (InputStream stream = container.readBlob(readBlobName)) {
                 BytesRefBuilder target = new BytesRefBuilder();
                 while (target.length() < data.length) {
                     byte[] buffer = new byte[scaledRandomIntBetween(1, data.length - target.length())];
