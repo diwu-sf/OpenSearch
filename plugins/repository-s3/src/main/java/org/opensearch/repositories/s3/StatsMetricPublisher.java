@@ -280,14 +280,8 @@ public class StatsMetricPublisher {
             results.put("PutObject", putMetrics.get());
             results.put("DeleteObjects", deleteMetrics.get());
             results.put("PutMultipartObject", multiPartPutMetrics.get());
-            // Only surface the server side copy counters once a copy has actually happened. Emitting them
-            // unconditionally would add always-zero keys to the repository stats of every existing deployment.
-            if (copyMetrics.get() > 0) {
-                results.put("CopyObject", copyMetrics.get());
-            }
-            if (multiPartCopyMetrics.get() > 0) {
-                results.put("CopyMultipartObject", multiPartCopyMetrics.get());
-            }
+            results.put("CopyObject", copyMetrics.get());
+            results.put("CopyMultipartObject", multiPartCopyMetrics.get());
             return results;
         }
     }
