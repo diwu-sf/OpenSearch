@@ -38,6 +38,7 @@ import com.google.cloud.WriteChannel;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
+import com.google.cloud.storage.CopyWriter;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.Storage.BlobListOption;
 import com.google.cloud.storage.StorageBatch;
@@ -66,6 +67,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -211,6 +213,40 @@ class GoogleCloudStorageBlobStore implements BlobStore {
         final BlobId blobId = BlobId.of(bucketName, blobName);
         final Blob blob = AccessController.doPrivilegedChecked(() -> client().get(blobId));
         return blob != null;
+    }
+
+    /**
+     * Copies a blob from another bucket/blob store into this one using the GCS rewrite API, so that the object data
+     * never travels through this node.
+     * <p>
+     * A rewrite may not complete in a single call for large objects, so the returned {@link CopyWriter} is driven to
+     * completion. GCS charges the rewrite to the destination and preserves the source object's bytes exactly.
+     *
+     * @param sourceBlobStore the blob store holding the source blob
+     * @param sourceBlobName  fully qualified name of the source blob
+     * @param targetBlobName  fully qualified name to give the copy in this blob store
+     */
+    void copyBlob(GoogleCloudStorageBlobStore sourceBlobStore, String sourceBlobName, String targetBlobName) throws IOException {
+        final BlobId sourceBlobId = BlobId.of(sourceBlobStore.bucketName, sourceBlobName);
+        final BlobInfo targetBlobInfo = BlobInfo.newBuilder(BlobId.of(bucketName, targetBlobName)).build();
+        try {
+            AccessController.doPrivilegedChecked(() -> {
+                CopyWriter copyWriter = client().copy(
+                    Storage.CopyRequest.newBuilder().setSource(sourceBlobId).setTarget(targetBlobInfo).build()
+                );
+                // Large objects are rewritten in chunks; keep going until GCS reports the copy is complete.
+                while (copyWriter.isDone() == false) {
+                    copyWriter.copyChunk();
+                }
+                return null;
+            });
+            stats.trackPostOperation();
+        } catch (final StorageException se) {
+            if (se.getCode() == HTTP_NOT_FOUND) {
+                throw new NoSuchFileException("Copy source [" + sourceBlobName + "] not found: " + se.getMessage());
+            }
+            throw new IOException("Unable to copy object [" + targetBlobName + "] from [" + sourceBlobName + "]", se);
+        }
     }
 
     /**

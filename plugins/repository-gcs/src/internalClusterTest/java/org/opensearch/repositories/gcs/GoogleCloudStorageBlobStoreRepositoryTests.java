@@ -68,6 +68,7 @@ import org.opensearch.repositories.blobstore.OpenSearchMockAPIBasedRepositoryInt
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.NoSuchFileException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -239,6 +240,34 @@ public class GoogleCloudStorageBlobStoreRepositoryTests extends OpenSearchMockAP
                 assertEquals(data.length, target.length());
                 assertArrayEquals(data, Arrays.copyOfRange(target.bytes(), 0, target.length()));
             }
+            container.delete();
+        }
+    }
+
+    public void testServerSideCopy() throws IOException {
+        try (BlobStore store = newBlobStore()) {
+            final BlobContainer container = store.blobContainer(new BlobPath());
+            final byte[] data = randomBytes(randomIntBetween(128, 512));
+            writeBlob(container, "source", new BytesArray(data), true);
+
+            assertTrue(container.isServerSideCopySupported(container));
+            container.copyBlob(container, "source", "target", data.length);
+
+            try (InputStream stream = container.readBlob("target")) {
+                assertArrayEquals(data, stream.readAllBytes());
+            }
+            // the source is left untouched
+            try (InputStream stream = container.readBlob("source")) {
+                assertArrayEquals(data, stream.readAllBytes());
+            }
+            container.delete();
+        }
+    }
+
+    public void testServerSideCopyOfMissingSourceThrows() throws IOException {
+        try (BlobStore store = newBlobStore()) {
+            final BlobContainer container = store.blobContainer(new BlobPath());
+            expectThrows(NoSuchFileException.class, () -> container.copyBlob(container, "missing", "target", 128L));
             container.delete();
         }
     }

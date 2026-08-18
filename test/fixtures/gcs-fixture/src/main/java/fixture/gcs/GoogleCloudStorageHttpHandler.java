@@ -50,6 +50,7 @@ import org.opensearch.rest.RestUtils;
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.net.URLDecoder;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.URLDecoder;
@@ -222,6 +223,43 @@ public class GoogleCloudStorageHttpHandler implements HttpHandler {
                     response.writeTo(exchange.getResponseBody());
                 } else {
                     exchange.sendResponseHeaders(RestStatus.NOT_FOUND.getStatus(), -1);
+                }
+
+            } else if (Regex.simpleMatch("POST /storage/v1/b/*/o/*/rewriteTo/b/*/o/*", request)) {
+                // Rewrite Object https://cloud.google.com/storage/docs/json_api/v1/objects/rewrite
+                // Used by Storage#copy for server side copies. The whole object is rewritten in one call here, so the
+                // response always reports the rewrite as done.
+                final String path = exchange.getRequestURI().getPath();
+                final int rewriteIdx = path.indexOf("/rewriteTo/b/");
+                final String sourceKey = URLDecoder.decode(
+                    path.substring(path.indexOf("/o/", path.indexOf("/b/")) + "/o/".length(), rewriteIdx),
+                    UTF_8
+                );
+                final String targetPath = path.substring(rewriteIdx + "/rewriteTo/b/".length());
+                final String targetKey = URLDecoder.decode(targetPath.substring(targetPath.indexOf("/o/") + "/o/".length()), UTF_8);
+
+                final BytesReference sourceBlob = blobs.get(sourceKey);
+                if (sourceBlob == null) {
+                    exchange.sendResponseHeaders(RestStatus.NOT_FOUND.getStatus(), -1);
+                } else {
+                    blobs.put(targetKey, sourceBlob);
+                    final byte[] response = String.format(
+                        """
+                            {
+                                "kind": "storage#rewriteResponse",
+                                "totalBytesRewritten": "%s",
+                                "objectSize": "%s",
+                                "done": true,
+                                "resource": %s
+                            }
+                            """,
+                        sourceBlob.length(),
+                        sourceBlob.length(),
+                        buildBlobInfoJson(targetKey, sourceBlob.length())
+                    ).getBytes(UTF_8);
+                    exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+                    exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
+                    exchange.getResponseBody().write(response);
                 }
 
             } else if (Regex.simpleMatch("POST /batch/storage/v1", request)) {

@@ -123,6 +123,23 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
         blobStore.deleteBlobsIgnoringIfNotExists(blobNames.stream().map(this::buildKey).collect(Collectors.toList()));
     }
 
+    @Override
+    public boolean isServerSideCopySupported(BlobContainer sourceBlobContainer) {
+        // Sharing a GoogleCloudStorageBlobStore means sharing the client, credentials and bucket, which is what makes
+        // the rewrite safe to issue without further validation.
+        return sourceBlobContainer instanceof GoogleCloudStorageBlobContainer
+            && ((GoogleCloudStorageBlobContainer) sourceBlobContainer).blobStore == blobStore;
+    }
+
+    @Override
+    public void copyBlob(BlobContainer sourceBlobContainer, String sourceBlobName, String blobName, long blobSize) throws IOException {
+        if (sourceBlobContainer instanceof GoogleCloudStorageBlobContainer == false) {
+            throw new IllegalArgumentException("source blob container must be a GoogleCloudStorageBlobContainer");
+        }
+        final GoogleCloudStorageBlobContainer source = (GoogleCloudStorageBlobContainer) sourceBlobContainer;
+        blobStore.copyBlob(source.blobStore, source.buildKey(sourceBlobName), buildKey(blobName));
+    }
+
     private String buildKey(String blobName) {
         assert blobName != null;
         return path + blobName;
