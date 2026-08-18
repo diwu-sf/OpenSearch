@@ -102,6 +102,7 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.List;
@@ -126,7 +127,6 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
 
     private static final Logger logger = LogManager.getLogger(S3BlobContainer.class);
     private static final long DEFAULT_OPERATION_TIMEOUT = TimeUnit.SECONDS.toSeconds(30);
-    private static final int HTTP_NOT_FOUND = 404;
 
     private final S3BlobStore blobStore;
     private final String keyPath;
@@ -615,7 +615,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 }
             }
         } catch (final SdkException e) {
-            if (e instanceof SdkServiceException && ((SdkServiceException) e).statusCode() == HTTP_NOT_FOUND) {
+            if (e instanceof SdkServiceException && ((SdkServiceException) e).statusCode() == HttpURLConnection.HTTP_NOT_FOUND) {
                 throw new NoSuchFileException(
                     "Copy source [" + s3SourceBlobContainer.buildKey(sourceBlobName) + "] not found: " + e.getMessage()
                 );
