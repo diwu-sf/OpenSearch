@@ -27,10 +27,12 @@ import org.opensearch.common.blobstore.stream.read.ReadContext;
 import org.opensearch.common.blobstore.stream.write.WriteContext;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.io.InputStreamContainer;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.store.RemoteDirectory;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.index.translog.transfer.FileSnapshot.TransferFileSnapshot;
+import org.opensearch.repositories.gcs.async.AsyncExecutorContainer;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
@@ -51,6 +53,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -69,6 +72,13 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSearchTestCase {
+    private static final int MAX_CONCURRENT_OPERATIONS = 4;
+    private static final int MAX_PENDING_OPERATIONS = 8;
+    private final Settings asyncSettings = Settings.builder()
+        .put("node.processors", 1)
+        .put("gcs.client.default.max_concurrent_operations", MAX_CONCURRENT_OPERATIONS)
+        .put("gcs.client.default.max_pending_operations", MAX_PENDING_OPERATIONS)
+        .build();
     private ThreadPool threadPool;
     private Storage storage;
     private GoogleCloudStorageService service;
@@ -76,7 +86,10 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
     @Override
     public void setUp() throws Exception {
         super.setUp();
-        threadPool = new TestThreadPool(getTestName(), GoogleCloudStoragePlugin.asyncExecutorBuilder());
+        threadPool = new TestThreadPool(
+            getTestName(),
+            GoogleCloudStoragePlugin.asyncExecutorBuilders().toArray(org.opensearch.threadpool.ExecutorBuilder<?>[]::new)
+        );
         storage = mock(Storage.class);
         service = new GoogleCloudStorageService() {
             @Override
@@ -84,20 +97,89 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
                 return storage;
             }
         };
-        service.setAsyncExecutor(threadPool.executor(GoogleCloudStoragePlugin.ASYNC_TRANSFER));
+        service.refreshAndClearCache(GoogleCloudStorageClientSettings.load(asyncSettings));
+        setAsyncExecutor(threadPool.executor(GoogleCloudStorageAsyncService.ASYNC_TRANSFER));
     }
 
     @Override
     public void tearDown() throws Exception {
         try {
+            service.closeAsyncService();
             terminate(threadPool);
         } finally {
             super.tearDown();
         }
     }
 
+    private void setAsyncExecutor(Executor executor) {
+        service.closeAsyncService();
+        service.setAsyncService(
+            new GoogleCloudStorageAsyncService(
+                asyncSettings,
+                threadPool.getThreadContext(),
+                executor,
+                threadPool.executor(GoogleCloudStorageAsyncService.PRIORITY_ASYNC_TRANSFER),
+                threadPool.executor(GoogleCloudStorageAsyncService.URGENT_ASYNC_TRANSFER)
+            )
+        );
+    }
+
+    private AsyncExecutorContainer asyncClient() {
+        return service.asyncClients("default").client();
+    }
+
+    public void testUrgentAndHighUploadsBypassSaturatedNormalClient() throws Exception {
+        CountDownLatch started = new CountDownLatch(MAX_CONCURRENT_OPERATIONS);
+        CountDownLatch release = new CountDownLatch(1);
+        when(storage.create(any(BlobInfo.class), any(byte[].class), any(Storage.BlobTargetOption[].class))).thenAnswer(invocation -> {
+            String name = ((BlobInfo) invocation.getArgument(0)).getName();
+            assertTrue(Thread.currentThread().isVirtual());
+            if (name.startsWith("normal")) {
+                started.countDown();
+                assertTrue(release.await(30, TimeUnit.SECONDS));
+            } else if (name.equals("urgent")) {
+                assertTrue(Thread.currentThread().getName().contains(GoogleCloudStorageAsyncService.URGENT_ASYNC_TRANSFER));
+            } else if (name.equals("high")) {
+                assertTrue(Thread.currentThread().getName().contains(GoogleCloudStorageAsyncService.PRIORITY_ASYNC_TRANSFER));
+            }
+            return null;
+        });
+        List<CompletableFuture<Void>> results = new ArrayList<>();
+        try (GoogleCloudStorageBlobStore store = store()) {
+            AsyncMultiStreamBlobContainer container = (AsyncMultiStreamBlobContainer) store.blobContainer(BlobPath.cleanPath());
+            try {
+                for (int i = 0; i < MAX_CONCURRENT_OPERATIONS; i++) {
+                    results.add(upload(container, "normal-" + i));
+                }
+                assertTrue(started.await(30, TimeUnit.SECONDS));
+                for (int i = 0; i < MAX_PENDING_OPERATIONS; i++) {
+                    results.add(asyncClient().executeAsync(() -> null));
+                }
+                assertTrue(
+                    expectThrows(ExecutionException.class, () -> asyncClient().executeAsync(() -> null).get(30, TimeUnit.SECONDS))
+                        .getCause() instanceof RejectedExecutionException
+                );
+                for (WritePriority priority : List.of(WritePriority.URGENT, WritePriority.HIGH)) {
+                    String name = priority == WritePriority.URGENT ? "urgent" : "high";
+                    WriteContext source = context(name, new byte[] { 1, 2, 3 }, new AtomicInteger(), success -> {}, 3, true);
+                    WriteContext prioritized = new WriteContext.Builder().fileName(name)
+                        .fileSize(source.getFileSize())
+                        .streamContextSupplier(source::getStreamProvider)
+                        .uploadFinalizer(source.getUploadFinalizer())
+                        .writePriority(priority)
+                        .build();
+                    upload(container, prioritized).get(30, TimeUnit.SECONDS);
+                }
+                assertTrue(results.stream().noneMatch(CompletableFuture::isDone));
+            } finally {
+                release.countDown();
+            }
+            CompletableFuture.allOf(results.toArray(CompletableFuture[]::new)).get(30, TimeUnit.SECONDS);
+        }
+    }
+
     public void testConcurrencyIsBoundedAcrossRepositories() throws Exception {
-        int concurrency = GoogleCloudStoragePlugin.MAX_CONCURRENT_OPERATIONS;
+        int concurrency = MAX_CONCURRENT_OPERATIONS;
         CountDownLatch started = new CountDownLatch(concurrency);
         CountDownLatch release = new CountDownLatch(1);
         AtomicInteger active = new AtomicInteger();
@@ -160,7 +242,7 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
 
     public void testRejectedUploadNotifiesListener() throws Exception {
         RejectedExecutionException failure = new RejectedExecutionException("full");
-        service.setAsyncExecutor(command -> { throw failure; });
+        setAsyncExecutor(command -> { throw failure; });
         try (GoogleCloudStorageBlobStore store = new GoogleCloudStorageBlobStore("bucket", "default", "repo", service, 1024)) {
             CompletableFuture<Void> result = upload((AsyncMultiStreamBlobContainer) store.blobContainer(BlobPath.cleanPath()), "blob");
             ExecutionException exception = expectThrows(ExecutionException.class, () -> result.get(30, TimeUnit.SECONDS));
@@ -171,15 +253,15 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
 
     public void testPendingUploadsAreBoundedAndCapacityIsReleasedAfterFailure() throws Exception {
         List<Runnable> pending = new ArrayList<>();
-        service.setAsyncExecutor(pending::add);
-        int capacity = GoogleCloudStoragePlugin.MAX_CONCURRENT_OPERATIONS + GoogleCloudStorageService.MAX_PENDING_OPERATIONS;
+        setAsyncExecutor(pending::add);
+        int capacity = MAX_CONCURRENT_OPERATIONS + MAX_PENDING_OPERATIONS;
         List<CompletableFuture<Void>> results = new ArrayList<>();
         IOException failure = new IOException("upload failed");
         for (int i = 0; i < capacity; i++) {
-            results.add(service.executeAsync(() -> { throw failure; }));
+            results.add(asyncClient().executeAsync(() -> { throw failure; }));
         }
         assertTrue(
-            expectThrows(ExecutionException.class, () -> service.executeAsync(() -> null).get(30, TimeUnit.SECONDS))
+            expectThrows(ExecutionException.class, () -> asyncClient().executeAsync(() -> null).get(30, TimeUnit.SECONDS))
                 .getCause() instanceof RejectedExecutionException
         );
         assertEquals(capacity, pending.size());
@@ -189,14 +271,14 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
         }
         pending.clear();
         for (int i = 0; i < capacity; i++) {
-            service.executeAsync(() -> null);
+            asyncClient().executeAsync(() -> null);
         }
         assertEquals(capacity, pending.size());
         pending.forEach(Runnable::run);
     }
 
     public void testInterruptedUploadNotifiesListener() throws Exception {
-        service.setAsyncExecutor(command -> threadPool.executor(GoogleCloudStoragePlugin.ASYNC_TRANSFER).execute(() -> {
+        setAsyncExecutor(command -> threadPool.executor(GoogleCloudStorageAsyncService.ASYNC_TRANSFER).execute(() -> {
             Thread.currentThread().interrupt();
             command.run();
             assertTrue(Thread.interrupted());
@@ -269,6 +351,7 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
         WriteContext source = context("blob", new byte[] { 1, 2, 3 }, closed, finalized::set, 3, true);
         WriteContext invalid = new WriteContext.Builder().fileName("blob")
             .fileSize(expectedLength)
+            .writePriority(WritePriority.NORMAL)
             .uploadFinalizer(source.getUploadFinalizer())
             .streamContextSupplier(source::getStreamProvider)
             .build();
@@ -394,14 +477,14 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
     public void testReadStreamHoldsPermitUntilClose() throws Exception {
         List<InputStream> streams = new ArrayList<>();
         try {
-            for (int i = 0; i < GoogleCloudStoragePlugin.MAX_CONCURRENT_OPERATIONS; i++) {
+            for (int i = 0; i < MAX_CONCURRENT_OPERATIONS; i++) {
                 streams.add(
-                    service.openReadStreamAsync(() -> new InputStreamContainer(new ByteArrayInputStream(new byte[0]), 0, 0))
+                    asyncClient().openReadStreamAsync(() -> new InputStreamContainer(new ByteArrayInputStream(new byte[0]), 0, 0))
                         .get(30, TimeUnit.SECONDS)
                         .getInputStream()
                 );
             }
-            CompletableFuture<Void> upload = service.executeAsync(() -> null);
+            CompletableFuture<Void> upload = asyncClient().executeAsync(() -> null);
             assertFalse(upload.isDone());
             InputStream released = streams.remove(0);
             released.close();
@@ -416,9 +499,9 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
 
     public void testCancelledReadClosesStreamAndReleasesCapacity() throws Exception {
         List<Runnable> queued = new ArrayList<>();
-        service.setAsyncExecutor(queued::add);
+        setAsyncExecutor(queued::add);
         AtomicInteger closed = new AtomicInteger();
-        CompletableFuture<InputStreamContainer> result = service.openReadStreamAsync(
+        CompletableFuture<InputStreamContainer> result = asyncClient().openReadStreamAsync(
             () -> new InputStreamContainer(new ByteArrayInputStream(new byte[0]) {
                 @Override
                 public void close() {
@@ -429,14 +512,14 @@ public class GoogleCloudStorageAsyncMultiStreamBlobContainerTests extends OpenSe
         assertTrue(result.cancel(false));
         queued.remove(0).run();
         assertEquals(1, closed.get());
-        service.setAsyncExecutor(threadPool.executor(GoogleCloudStoragePlugin.ASYNC_TRANSFER));
+        setAsyncExecutor(threadPool.executor(GoogleCloudStorageAsyncService.ASYNC_TRANSFER));
         testReadStreamHoldsPermitUntilClose();
     }
 
     public void testFailedReadReleasesCapacity() throws Exception {
         IOException failure = new IOException("read failed");
-        for (int i = 0; i < GoogleCloudStoragePlugin.MAX_CONCURRENT_OPERATIONS; i++) {
-            CompletableFuture<InputStreamContainer> result = service.openReadStreamAsync(() -> { throw failure; });
+        for (int i = 0; i < MAX_CONCURRENT_OPERATIONS; i++) {
+            CompletableFuture<InputStreamContainer> result = asyncClient().openReadStreamAsync(() -> { throw failure; });
             assertSame(failure, expectThrows(ExecutionException.class, () -> result.get(30, TimeUnit.SECONDS)).getCause());
         }
         testReadStreamHoldsPermitUntilClose();

@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.repositories.gcs;
+package org.opensearch.repositories.gcs.async;
 
 import org.opensearch.common.StreamContext;
 

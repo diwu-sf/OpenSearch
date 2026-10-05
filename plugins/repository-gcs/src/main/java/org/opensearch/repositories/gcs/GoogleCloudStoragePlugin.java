@@ -68,16 +68,17 @@ public class GoogleCloudStoragePlugin extends Plugin implements RepositoryPlugin
 
     private static final Logger logger = LogManager.getLogger(GoogleCloudStoragePlugin.class);
 
-    static final String ASYNC_TRANSFER = "gcs_async_transfer";
-    static final int MAX_CONCURRENT_OPERATIONS = 100;
-
-    static ExecutorBuilder<?> asyncExecutorBuilder() {
-        return new VirtualExecutorBuilder(ASYNC_TRANSFER);
+    static List<ExecutorBuilder<?>> asyncExecutorBuilders() {
+        return List.of(
+            new VirtualExecutorBuilder(GoogleCloudStorageAsyncService.ASYNC_TRANSFER),
+            new VirtualExecutorBuilder(GoogleCloudStorageAsyncService.PRIORITY_ASYNC_TRANSFER),
+            new VirtualExecutorBuilder(GoogleCloudStorageAsyncService.URGENT_ASYNC_TRANSFER)
+        );
     }
 
     @Override
     public List<ExecutorBuilder<?>> getExecutorBuilders(Settings settings) {
-        return List.of(asyncExecutorBuilder());
+        return asyncExecutorBuilders();
     }
 
     @Override
@@ -94,7 +95,7 @@ public class GoogleCloudStoragePlugin extends Plugin implements RepositoryPlugin
         IndexNameExpressionResolver expressionResolver,
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
-        storageService.setAsyncExecutor(threadPool.executor(ASYNC_TRANSFER));
+        storageService.setAsyncService(new GoogleCloudStorageAsyncService(environment.settings(), threadPool));
         return List.of();
     }
 
@@ -167,6 +168,12 @@ public class GoogleCloudStoragePlugin extends Plugin implements RepositoryPlugin
     @Override
     public List<Setting<?>> getSettings() {
         return Arrays.asList(
+            GoogleCloudStorageAsyncService.PRIORITY_PERMIT_ALLOCATION_PERCENT,
+            GoogleCloudStorageAsyncService.PERMIT_WAIT_DURATION_MIN,
+            GoogleCloudStorageAsyncService.TRANSFER_QUEUE_CONSUMERS,
+            GoogleCloudStorageClientSettings.MAX_CONCURRENT_OPERATIONS_SETTING,
+            GoogleCloudStorageClientSettings.MAX_PENDING_OPERATIONS_SETTING,
+            GoogleCloudStorageClientSettings.OPERATION_ACQUISITION_TIMEOUT_SETTING,
             GoogleCloudStorageClientSettings.CREDENTIALS_FILE_SETTING,
             GoogleCloudStorageClientSettings.ENDPOINT_SETTING,
             GoogleCloudStorageClientSettings.PROJECT_ID_SETTING,
@@ -183,6 +190,11 @@ public class GoogleCloudStoragePlugin extends Plugin implements RepositoryPlugin
             GoogleCloudStorageClientSettings.TRUSTSTORE_PASSWORD_SETTING,
             GoogleCloudStorageClientSettings.TRUSTSTORE_TYPE_SETTING
         );
+    }
+
+    @Override
+    public void close() {
+        storageService.closeAsyncService();
     }
 
     @Override

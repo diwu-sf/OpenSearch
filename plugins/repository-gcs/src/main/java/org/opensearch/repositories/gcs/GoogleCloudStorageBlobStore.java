@@ -34,7 +34,6 @@ package org.opensearch.repositories.gcs;
 
 import com.google.api.gax.paging.Page;
 import com.google.cloud.BatchResult;
-import com.google.cloud.WriteChannel;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
@@ -44,12 +43,7 @@ import com.google.cloud.storage.StorageBatch;
 import com.google.cloud.storage.StorageException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.logging.log4j.message.ParameterizedMessage;
-import org.opensearch.ExceptionsHelper;
-import org.opensearch.common.CheckedConsumer;
 import org.opensearch.common.CheckedSupplier;
-import org.opensearch.common.StreamContext;
-import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
@@ -60,36 +54,29 @@ import org.opensearch.common.blobstore.stream.write.WriteContext;
 import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.common.collect.MapBuilder;
 import org.opensearch.common.io.InputStreamContainer;
-import org.opensearch.common.io.Streams;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.repositories.gcs.async.AsyncExecutorContainer;
+import org.opensearch.repositories.gcs.async.AsyncPartsHandler;
 import org.opensearch.secure_sm.AccessController;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
-import java.nio.channels.WritableByteChannel;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
-import static java.net.HttpURLConnection.HTTP_GONE;
 import static java.net.HttpURLConnection.HTTP_NOT_FOUND;
-import static java.net.HttpURLConnection.HTTP_PRECON_FAILED;
 
 class GoogleCloudStorageBlobStore implements BlobStore {
 
@@ -125,7 +112,7 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     private final String repositoryName;
     private final GoogleCloudStorageService storageService;
     private final GoogleCloudStorageOperationsStats stats;
-    private final int bufferSize;
+    private final AsyncPartsHandler partsHandler;
 
     GoogleCloudStorageBlobStore(
         String bucketName,
@@ -139,7 +126,13 @@ class GoogleCloudStorageBlobStore implements BlobStore {
         this.repositoryName = repositoryName;
         this.storageService = storageService;
         this.stats = new GoogleCloudStorageOperationsStats(bucketName);
-        this.bufferSize = bufferSize;
+        this.partsHandler = new AsyncPartsHandler(
+            this::client,
+            bufferSize,
+            this::getLargeBlobThresholdInBytes,
+            stats::trackPutOperation,
+            stats::trackPostOperation
+        );
     }
 
     private Storage client() throws IOException {
@@ -270,33 +263,24 @@ class GoogleCloudStorageBlobStore implements BlobStore {
      */
     void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
         final BlobInfo blobInfo = BlobInfo.newBuilder(bucketName, blobName).build();
-        if (blobSize > getLargeBlobThresholdInBytes()) {
-            writeBlobResumable(blobInfo, inputStream, blobSize, failIfAlreadyExists);
-        } else {
-            writeBlobMultipart(blobInfo, inputStream, blobSize, failIfAlreadyExists);
-        }
+        partsHandler.writeBlob(blobInfo, inputStream, blobSize, failIfAlreadyExists, null);
     }
 
-    void asyncBlobUpload(String blobName, WriteContext context, ActionListener<Void> listener) {
-        executeAsync(() -> {
-            if (context.getFileSize() < 0) {
-                throw new IllegalArgumentException("Upload size must be non-negative");
-            }
-            if (context.doRemoteDataIntegrityCheck()) {
-                throw new IllegalArgumentException("GCS uploads require local CRC32 verification");
-            }
-            Objects.requireNonNull(context.getUploadFinalizer(), "Upload finalizer is required");
-            StreamContext streams = context.getStreamProvider(Math.max(1L, context.getFileSize()));
-            BlobInfo info = BlobInfo.newBuilder(bucketName, blobName).setMetadata(context.getMetadata()).build();
-            try (InputStream input = new GoogleCloudStorageMultiStreamInputStream(streams, context.getFileSize())) {
-                if (context.getFileSize() > getLargeBlobThresholdInBytes()) {
-                    writeBlobResumable(info, input, context.getFileSize(), context.isFailIfAlreadyExists(), context.getUploadFinalizer());
-                } else {
-                    writeBlobMultipart(info, input, context.getFileSize(), context.isFailIfAlreadyExists(), context.getUploadFinalizer());
-                }
-            }
-            return null;
-        }, listener);
+    GoogleCloudStorageAsyncClients asyncClients() {
+        return storageService.asyncClients(clientName);
+    }
+
+    void asyncBlobUpload(AsyncExecutorContainer client, String blobName, WriteContext context, ActionListener<Void> listener) {
+        try {
+            notifyListener(
+                storageService.asyncService()
+                    .transferManager()
+                    .uploadObject(client, context, () -> partsHandler.uploadObject(bucketName, blobName, context)),
+                listener
+            );
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
     }
 
     void readBlobAsync(String blobName, ActionListener<ReadContext> listener) {
@@ -307,9 +291,8 @@ class GoogleCloudStorageBlobStore implements BlobStore {
             }
             BlobId id = BlobId.of(bucketName, blobName, blob.getGeneration());
             long length = blob.getSize();
-            ReadContext.StreamPartCreator part = () -> storageService.openReadStreamAsync(
-                () -> new InputStreamContainer(readBlob(id, length), length, 0)
-            );
+            ReadContext.StreamPartCreator part = () -> asyncClients().client()
+                .openReadStreamAsync(() -> new InputStreamContainer(readBlob(id, length), length, 0));
             return new ReadContext.Builder(length, List.of(part)).metadata(blob.getMetadata()).build();
         }, listener);
     }
@@ -321,11 +304,15 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     <T> void executeAsync(CheckedSupplier<T, IOException> operation, ActionListener<T> listener) {
         final CompletableFuture<T> future;
         try {
-            future = storageService.executeAsync(operation);
+            future = asyncClients().client().executeAsync(operation);
         } catch (Exception e) {
             listener.onFailure(e);
             return;
         }
+        notifyListener(future, listener);
+    }
+
+    private static <T> void notifyListener(CompletableFuture<T> future, ActionListener<T> listener) {
         future.whenComplete((result, failure) -> {
             if (failure == null) {
                 listener.onResponse(result);
@@ -339,154 +326,6 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     // non-static, package private for testing
     long getLargeBlobThresholdInBytes() {
         return LARGE_BLOB_THRESHOLD_BYTE_SIZE;
-    }
-
-    /**
-     * Uploads a blob using the "resumable upload" method (multiple requests, which
-     * can be independently retried in case of failure, see
-     * https://cloud.google.com/storage/docs/json_api/v1/how-tos/resumable-upload
-     * @param blobInfo the info for the blob to be uploaded
-     * @param inputStream the stream containing the blob data
-     * @param size expected size of the blob to be written
-     * @param failIfAlreadyExists whether to throw a FileAlreadyExistsException if the given blob already exists
-     */
-    private void writeBlobResumable(BlobInfo blobInfo, InputStream inputStream, long size, boolean failIfAlreadyExists) throws IOException {
-        writeBlobResumable(blobInfo, inputStream, size, failIfAlreadyExists, null);
-    }
-
-    private void writeBlobResumable(
-        BlobInfo blobInfo,
-        InputStream inputStream,
-        long size,
-        boolean failIfAlreadyExists,
-        CheckedConsumer<Boolean, IOException> finalizer
-    ) throws IOException {
-        // We retry 410 GONE errors to cover the unlikely but possible scenario where a resumable upload session becomes broken and
-        // needs to be restarted from scratch. Given how unlikely a 410 error should be according to SLAs we retry only twice.
-        assert inputStream.markSupported();
-        inputStream.mark(Integer.MAX_VALUE);
-        final byte[] buffer = new byte[size < bufferSize ? Math.toIntExact(size) : bufferSize];
-        StorageException storageException = null;
-        final Storage.BlobWriteOption[] writeOptions = failIfAlreadyExists
-            ? new Storage.BlobWriteOption[] { Storage.BlobWriteOption.doesNotExist() }
-            : new Storage.BlobWriteOption[0];
-        for (int retry = 0; retry < 3; ++retry) {
-            try {
-                final WriteChannel writeChannel = AccessController.doPrivilegedChecked(() -> client().writer(blobInfo, writeOptions));
-                /*
-                 * It is not enough to wrap the call to Streams#copy, we have to wrap the privileged calls too; this is because Streams#copy
-                 * is in the stacktrace and is not granted the permissions needed to close and write the channel.
-                 */
-                OutputStream output = Channels.newOutputStream(new WritableByteChannel() {
-
-                    @SuppressForbidden(reason = "channel is based on a socket")
-                    @Override
-                    public int write(final ByteBuffer src) throws IOException {
-                        try {
-                            return AccessController.doPrivilegedChecked(() -> writeChannel.write(src));
-                        } catch (final IOException ioe) {
-                            final StorageException storageException = (StorageException) ExceptionsHelper.unwrap(
-                                ioe,
-                                StorageException.class
-                            );
-                            if (storageException != null) {
-                                throw storageException;
-                            }
-                            throw ioe;
-                        }
-                    }
-
-                    @Override
-                    public boolean isOpen() {
-                        return writeChannel.isOpen();
-                    }
-
-                    @Override
-                    public void close() throws IOException {
-                        AccessController.doPrivilegedChecked(writeChannel::close);
-                    }
-                });
-                // Closing a GCS WriteChannel commits the object. Async uploads validate before closing;
-                // on failure an uncommitted session is left to expire rather than publishing a corrupt object.
-                org.opensearch.common.util.io.Streams.copy(inputStream, output, buffer, finalizer == null);
-                if (finalizer != null) {
-                    finalizer.accept(true);
-                    output.close();
-                }
-                // We don't track this operation on the http layer as
-                // we do with the GET/LIST operations since this operations
-                // can trigger multiple underlying http requests but only one
-                // operation is billed.
-                stats.trackPutOperation();
-                return;
-            } catch (final StorageException se) {
-                final int errorCode = se.getCode();
-                if (errorCode == HTTP_GONE) {
-                    logger.warn(() -> new ParameterizedMessage("Retrying broken resumable upload session for blob {}", blobInfo), se);
-                    storageException = ExceptionsHelper.useOrSuppress(storageException, se);
-                    inputStream.reset();
-                    continue;
-                } else if (failIfAlreadyExists && errorCode == HTTP_PRECON_FAILED) {
-                    throw new FileAlreadyExistsException(blobInfo.getBlobId().getName(), null, se.getMessage());
-                }
-                if (storageException != null) {
-                    se.addSuppressed(storageException);
-                }
-                throw se;
-            }
-        }
-        assert storageException != null;
-        throw storageException;
-    }
-
-    /**
-     * Uploads a blob using the "multipart upload" method (a single
-     * 'multipart/related' request containing both data and metadata. The request is
-     * gziped), see:
-     * https://cloud.google.com/storage/docs/json_api/v1/how-tos/multipart-upload
-     *  @param blobInfo the info for the blob to be uploaded
-     * @param inputStream the stream containing the blob data
-     * @param blobSize the size
-     * @param failIfAlreadyExists whether to throw a FileAlreadyExistsException if the given blob already exists
-     */
-    private void writeBlobMultipart(BlobInfo blobInfo, InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
-        throws IOException {
-        writeBlobMultipart(blobInfo, inputStream, blobSize, failIfAlreadyExists, null);
-    }
-
-    private void writeBlobMultipart(
-        BlobInfo blobInfo,
-        InputStream inputStream,
-        long blobSize,
-        boolean failIfAlreadyExists,
-        CheckedConsumer<Boolean, IOException> finalizer
-    ) throws IOException {
-        assert blobSize <= getLargeBlobThresholdInBytes() : "large blob uploads should use the resumable upload method";
-        final byte[] buffer = new byte[Math.toIntExact(blobSize)];
-        Streams.readFully(inputStream, buffer);
-        if (finalizer != null) {
-            // Consume EOF to validate the complete stream before issuing the object-creating request.
-            if (inputStream.read() != -1) {
-                throw new IOException("Upload stream exceeds expected length " + blobSize);
-            }
-            finalizer.accept(true);
-        }
-        try {
-            final Storage.BlobTargetOption[] targetOptions = failIfAlreadyExists
-                ? new Storage.BlobTargetOption[] { Storage.BlobTargetOption.doesNotExist() }
-                : new Storage.BlobTargetOption[0];
-            AccessController.doPrivilegedChecked(() -> client().create(blobInfo, buffer, targetOptions));
-            // We don't track this operation on the http layer as
-            // we do with the GET/LIST operations since this operations
-            // can trigger multiple underlying http requests but only one
-            // operation is billed.
-            stats.trackPostOperation();
-        } catch (final StorageException se) {
-            if (failIfAlreadyExists && se.getCode() == HTTP_PRECON_FAILED) {
-                throw new FileAlreadyExistsException(blobInfo.getBlobId().getName(), null, se.getMessage());
-            }
-            throw se;
-        }
     }
 
     /**

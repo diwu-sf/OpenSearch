@@ -41,8 +41,10 @@ import org.opensearch.common.blobstore.BlobStoreException;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.stream.read.ReadContext;
 import org.opensearch.common.blobstore.stream.write.WriteContext;
+import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.blobstore.support.AbstractBlobContainer;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.repositories.gcs.async.AsyncExecutorContainer;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -102,7 +104,20 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer implements A
 
     @Override
     public void asyncBlobUpload(WriteContext context, ActionListener<Void> listener) {
-        blobStore.asyncBlobUpload(buildKey(context.getFileName()), context, listener);
+        try {
+            GoogleCloudStorageAsyncClients clients = blobStore.asyncClients();
+            AsyncExecutorContainer client;
+            if (context.getWritePriority() == WritePriority.URGENT) {
+                client = clients.urgentClient();
+            } else if (context.getWritePriority() == WritePriority.HIGH) {
+                client = clients.priorityClient();
+            } else {
+                client = clients.client();
+            }
+            blobStore.asyncBlobUpload(client, buildKey(context.getFileName()), context, listener);
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
     }
 
     @Override

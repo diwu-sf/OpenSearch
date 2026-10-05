@@ -65,6 +65,22 @@ public class GoogleCloudStorageClientSettings {
 
     private static final String PREFIX = "gcs.client.";
 
+    static final Setting.AffixSetting<Integer> MAX_CONCURRENT_OPERATIONS_SETTING = Setting.affixKeySetting(
+        PREFIX,
+        "max_concurrent_operations",
+        key -> Setting.intSetting(key, 500, 1, 1_000_000, Setting.Property.NodeScope)
+    );
+    static final Setting.AffixSetting<Integer> MAX_PENDING_OPERATIONS_SETTING = Setting.affixKeySetting(
+        PREFIX,
+        "max_pending_operations",
+        key -> Setting.intSetting(key, 10_000, 0, 1_000_000, Setting.Property.NodeScope)
+    );
+    static final Setting.AffixSetting<TimeValue> OPERATION_ACQUISITION_TIMEOUT_SETTING = Setting.affixKeySetting(
+        PREFIX,
+        "operation_acquisition_timeout",
+        key -> Setting.timeSetting(key, TimeValue.timeValueMinutes(15), TimeValue.ZERO, Setting.Property.NodeScope)
+    );
+
     /** A json Service Account file loaded from secure settings. */
     static final Setting.AffixSetting<InputStream> CREDENTIALS_FILE_SETTING = Setting.affixKeySetting(
         PREFIX,
@@ -216,6 +232,10 @@ public class GoogleCloudStorageClientSettings {
     /** The GCS SDK Truststore settings. */
     private final TruststoreSettings truststoreSettings;
 
+    private final int maxConcurrentOperations;
+    private final int maxPendingOperations;
+    private final TimeValue operationAcquisitionTimeout;
+
     GoogleCloudStorageClientSettings(
         final ServiceAccountCredentials credential,
         final String endpoint,
@@ -227,6 +247,36 @@ public class GoogleCloudStorageClientSettings {
         final ProxySettings proxySettings,
         final TruststoreSettings truststoreSettings
     ) {
+        this(
+            credential,
+            endpoint,
+            projectId,
+            connectTimeout,
+            readTimeout,
+            applicationName,
+            tokenUri,
+            proxySettings,
+            truststoreSettings,
+            500,
+            10_000,
+            TimeValue.timeValueMinutes(15)
+        );
+    }
+
+    GoogleCloudStorageClientSettings(
+        final ServiceAccountCredentials credential,
+        final String endpoint,
+        final String projectId,
+        final TimeValue connectTimeout,
+        final TimeValue readTimeout,
+        final String applicationName,
+        final URI tokenUri,
+        final ProxySettings proxySettings,
+        final TruststoreSettings truststoreSettings,
+        final int maxConcurrentOperations,
+        final int maxPendingOperations,
+        final TimeValue operationAcquisitionTimeout
+    ) {
         this.credential = credential;
         this.endpoint = endpoint;
         this.projectId = projectId;
@@ -236,6 +286,21 @@ public class GoogleCloudStorageClientSettings {
         this.tokenUri = tokenUri;
         this.proxySettings = proxySettings;
         this.truststoreSettings = truststoreSettings;
+        this.maxConcurrentOperations = maxConcurrentOperations;
+        this.maxPendingOperations = maxPendingOperations;
+        this.operationAcquisitionTimeout = operationAcquisitionTimeout;
+    }
+
+    int getMaxConcurrentOperations() {
+        return maxConcurrentOperations;
+    }
+
+    int getMaxPendingOperations() {
+        return maxPendingOperations;
+    }
+
+    TimeValue getOperationAcquisitionTimeout() {
+        return operationAcquisitionTimeout;
     }
 
     public ServiceAccountCredentials getCredential() {
@@ -297,7 +362,10 @@ public class GoogleCloudStorageClientSettings {
             getConfigValue(settings, clientName, APPLICATION_NAME_SETTING),
             getConfigValue(settings, clientName, TOKEN_URI_SETTING),
             validateAndCreateProxySettings(settings, clientName),
-            validateAndCreateTruststoreSettings(settings, clientName)
+            validateAndCreateTruststoreSettings(settings, clientName),
+            getConfigValue(settings, clientName, MAX_CONCURRENT_OPERATIONS_SETTING),
+            getConfigValue(settings, clientName, MAX_PENDING_OPERATIONS_SETTING),
+            getConfigValue(settings, clientName, OPERATION_ACQUISITION_TIMEOUT_SETTING)
         );
     }
 
