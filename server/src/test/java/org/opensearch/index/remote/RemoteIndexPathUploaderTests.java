@@ -43,6 +43,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.mockito.Mockito;
@@ -249,6 +252,42 @@ public class RemoteIndexPathUploaderTests extends OpenSearchTestCase {
         assertEquals(1, successCount.get());
         assertEquals(0, failureCount.get());
         verify(blobContainer, times(1)).writeBlob(anyString(), any(InputStream.class), anyLong(), anyBoolean());
+    }
+
+    public void testSubmitsAllAsyncBlobUploadsBeforeWaiting() throws Exception {
+        AsyncMultiStreamBlobContainer asyncContainer = mock(AsyncMultiStreamBlobContainer.class);
+        when(blobStore.blobContainer(any(BlobPath.class))).thenReturn(asyncContainer);
+        CountDownLatch submitted = new CountDownLatch(2);
+        List<ActionListener<Void>> callbacks = new CopyOnWriteArrayList<>();
+        Mockito.doAnswer(invocation -> {
+            callbacks.add(invocation.getArgument(1));
+            submitted.countDown();
+            return null;
+        }).when(asyncContainer).asyncBlobUpload(any(), any());
+        RemoteIndexPathUploader uploader = new RemoteIndexPathUploader(
+            threadPool,
+            settings,
+            () -> repositoriesService,
+            clusterSettings,
+            DefaultRemoteStoreSettings.INSTANCE
+        );
+        uploader.start();
+        uploader.onUpload(
+            List.of(indexMetadataList.get(0), IndexMetadata.builder(indexMetadataList.get(0)).index("second").build()),
+            Collections.emptyMap(),
+            ActionListener.wrap(response -> successCount.incrementAndGet(), failure -> failureCount.incrementAndGet())
+        );
+        try {
+            assertTrue(submitted.await(10, TimeUnit.SECONDS));
+            assertEquals(0, successCount.get());
+            callbacks.remove(0).onResponse(null);
+            assertEquals(0, successCount.get());
+        } finally {
+            callbacks.forEach(callback -> callback.onResponse(null));
+        }
+        assertBusy(() -> assertEquals(1, successCount.get()));
+        assertEquals(0, failureCount.get());
+        verify(asyncContainer, times(0)).writeBlob(anyString(), any(InputStream.class), anyLong(), anyBoolean());
     }
 
     public void testInterceptWithDifferentRepo() throws IOException {

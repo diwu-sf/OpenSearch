@@ -34,27 +34,69 @@ package org.opensearch.repositories.gcs;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
+import org.opensearch.env.NodeEnvironment;
 import org.opensearch.indices.recovery.RecoverySettings;
 import org.opensearch.plugins.ExtensiblePlugin;
 import org.opensearch.plugins.NativeRemoteObjectStoreProvider;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.ReloadablePlugin;
 import org.opensearch.plugins.RepositoryPlugin;
+import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.repositories.Repository;
+import org.opensearch.script.ScriptService;
+import org.opensearch.threadpool.ExecutorBuilder;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.threadpool.VirtualExecutorBuilder;
+import org.opensearch.transport.client.Client;
+import org.opensearch.watcher.ResourceWatcherService;
 
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 public class GoogleCloudStoragePlugin extends Plugin implements RepositoryPlugin, ReloadablePlugin, ExtensiblePlugin {
 
     private static final Logger logger = LogManager.getLogger(GoogleCloudStoragePlugin.class);
+
+    static final String ASYNC_TRANSFER = "gcs_async_transfer";
+    static final int MAX_CONCURRENT_OPERATIONS = 100;
+
+    static ExecutorBuilder<?> asyncExecutorBuilder() {
+        return new VirtualExecutorBuilder(ASYNC_TRANSFER);
+    }
+
+    @Override
+    public List<ExecutorBuilder<?>> getExecutorBuilders(Settings settings) {
+        return List.of(asyncExecutorBuilder());
+    }
+
+    @Override
+    public Collection<Object> createComponents(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        ResourceWatcherService resourceWatcherService,
+        ScriptService scriptService,
+        NamedXContentRegistry xContentRegistry,
+        Environment environment,
+        NodeEnvironment nodeEnvironment,
+        NamedWriteableRegistry namedWriteableRegistry,
+        IndexNameExpressionResolver expressionResolver,
+        Supplier<RepositoriesService> repositoriesServiceSupplier
+    ) {
+        storageService.setAsyncExecutor(threadPool.executor(ASYNC_TRANSFER));
+        return List.of();
+    }
 
     // package-private for tests
     final GoogleCloudStorageService storageService;

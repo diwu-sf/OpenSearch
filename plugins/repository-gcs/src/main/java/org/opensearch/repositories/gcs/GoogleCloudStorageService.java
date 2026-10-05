@@ -46,13 +46,17 @@ import com.google.cloud.storage.StorageOptions;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
+import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.collect.MapBuilder;
+import org.opensearch.common.io.InputStreamContainer;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.secure_sm.AccessController;
 
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.Authenticator;
 import java.net.PasswordAuthentication;
 import java.net.Proxy;
@@ -63,6 +67,14 @@ import java.security.KeyStore;
 import java.security.Security;
 import java.util.Enumeration;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import static java.util.Collections.emptyMap;
 
@@ -78,6 +90,108 @@ public class GoogleCloudStorageService {
      * the repository name.
      */
     private volatile Map<String, Storage> clientCache = emptyMap();
+
+    private volatile Executor asyncExecutor;
+    static final int MAX_PENDING_OPERATIONS = 10_000;
+    // A node-wide limit shared by uploads, read streams and deletes across repositories.
+    private final Semaphore activeOperations = new Semaphore(GoogleCloudStoragePlugin.MAX_CONCURRENT_OPERATIONS, true);
+    private final Semaphore outstandingOperations = new Semaphore(
+        GoogleCloudStoragePlugin.MAX_CONCURRENT_OPERATIONS + MAX_PENDING_OPERATIONS
+    );
+
+    void setAsyncExecutor(Executor executor) {
+        this.asyncExecutor = Objects.requireNonNull(executor);
+    }
+
+    <T> CompletableFuture<T> executeAsync(CheckedSupplier<T, IOException> operation) {
+        return submitAsync(() -> {
+            try (RequestPermit permit = acquirePermit()) {
+                return operation.get();
+            }
+        }, ignored -> {});
+    }
+
+    CompletableFuture<InputStreamContainer> openReadStreamAsync(CheckedSupplier<InputStreamContainer, IOException> operation) {
+        return submitAsync(() -> {
+            RequestPermit permit = acquirePermit();
+            boolean handedOff = false;
+            try {
+                InputStreamContainer part = operation.get();
+                InputStream input = new FilterInputStream(part.getInputStream()) {
+                    private final AtomicBoolean closed = new AtomicBoolean();
+
+                    @Override
+                    public void close() throws IOException {
+                        if (closed.compareAndSet(false, true)) {
+                            try {
+                                super.close();
+                            } finally {
+                                permit.close();
+                            }
+                        }
+                    }
+                };
+                InputStreamContainer result = new InputStreamContainer(input, part.getContentLength(), part.getOffset());
+                handedOff = true;
+                return result;
+            } finally {
+                if (handedOff == false) {
+                    permit.close();
+                }
+            }
+        }, part -> {
+            try {
+                part.getInputStream().close();
+            } catch (IOException e) {
+                logger.warn("Failed to close a cancelled GCS read", e);
+            }
+        });
+    }
+
+    private RequestPermit acquirePermit() throws InterruptedException {
+        activeOperations.acquire();
+        return new RequestPermit();
+    }
+
+    private class RequestPermit implements AutoCloseable {
+        @Override
+        public void close() {
+            activeOperations.release();
+        }
+    }
+
+    private <T> CompletableFuture<T> submitAsync(CheckedSupplier<T, Exception> operation, Consumer<T> onDiscard) {
+        final Executor executor = Objects.requireNonNull(asyncExecutor, "GCS async executor is not initialized");
+        if (outstandingOperations.tryAcquire() == false) {
+            return CompletableFuture.failedFuture(new RejectedExecutionException("Too many outstanding GCS operations"));
+        }
+        final CompletableFuture<T> result = new CompletableFuture<>();
+        try {
+            // Keep the supplier future private: cancelling a waiting read must not bypass permit cleanup.
+            CompletableFuture.supplyAsync(() -> {
+                try {
+                    return operation.get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new CompletionException(e);
+                } catch (Exception e) {
+                    throw new CompletionException(e);
+                } finally {
+                    outstandingOperations.release();
+                }
+            }, executor).whenComplete((value, failure) -> {
+                if (failure != null) {
+                    result.completeExceptionally(failure);
+                } else if (result.complete(value) == false) {
+                    onDiscard.accept(value);
+                }
+            });
+        } catch (RuntimeException e) {
+            outstandingOperations.release();
+            result.completeExceptionally(e);
+        }
+        return result;
+    }
 
     final private GoogleApplicationDefaultCredentials googleApplicationDefaultCredentials;
 
