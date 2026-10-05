@@ -33,12 +33,18 @@
 package org.opensearch.repositories.gcs;
 
 import org.opensearch.common.Nullable;
+import org.opensearch.common.blobstore.AsyncMultiStreamBlobContainer;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStoreException;
 import org.opensearch.common.blobstore.DeleteResult;
+import org.opensearch.common.blobstore.stream.read.ReadContext;
+import org.opensearch.common.blobstore.stream.write.WriteContext;
+import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.blobstore.support.AbstractBlobContainer;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.repositories.gcs.async.AsyncExecutorContainer;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -46,7 +52,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
+class GoogleCloudStorageBlobContainer extends AbstractBlobContainer implements AsyncMultiStreamBlobContainer {
 
     private final GoogleCloudStorageBlobStore blobStore;
     private final String path;
@@ -97,6 +103,49 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
+    public void asyncBlobUpload(WriteContext context, ActionListener<Void> listener) {
+        try {
+            GoogleCloudStorageAsyncClients clients = blobStore.asyncClients();
+            AsyncExecutorContainer client;
+            if (context.getWritePriority() == WritePriority.URGENT) {
+                client = clients.urgentClient();
+            } else if (context.getWritePriority() == WritePriority.HIGH) {
+                client = clients.priorityClient();
+            } else {
+                client = clients.client();
+            }
+            blobStore.asyncBlobUpload(client, buildKey(context.getFileName()), context, listener);
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
+    }
+
+    @Override
+    public boolean remoteIntegrityCheckSupported() {
+        // OpenSearch uses CRC32; the GCS object checksum is CRC32C. Use the local upload finalizer.
+        return false;
+    }
+
+    @Override
+    public void readBlobAsync(String blobName, ActionListener<ReadContext> listener) {
+        blobStore.readBlobAsync(buildKey(blobName), listener);
+    }
+
+    @Override
+    public void deleteAsync(ActionListener<DeleteResult> listener) {
+        blobStore.executeAsync(this::delete, listener);
+    }
+
+    @Override
+    public void deleteBlobsAsyncIgnoringIfNotExists(List<String> blobNames, ActionListener<Void> listener) {
+        List<String> names = List.copyOf(blobNames);
+        blobStore.executeAsync(() -> {
+            deleteBlobsIgnoringIfNotExists(names);
+            return null;
+        }, listener);
+    }
+
+    @Override
     public void writeBlobWithMetadata(
         String blobName,
         InputStream inputStream,
@@ -104,7 +153,7 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
         boolean failIfAlreadyExists,
         @Nullable Map<String, String> metadata
     ) throws IOException {
-        // GCS plugin does not currently store custom metadata, so we delegate to writeBlob
+        // Preserve the existing synchronous behavior, which does not store custom metadata.
         writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
     }
 

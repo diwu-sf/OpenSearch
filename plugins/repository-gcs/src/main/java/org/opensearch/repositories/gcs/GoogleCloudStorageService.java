@@ -63,6 +63,7 @@ import java.security.KeyStore;
 import java.security.Security;
 import java.util.Enumeration;
 import java.util.Map;
+import java.util.Objects;
 
 import static java.util.Collections.emptyMap;
 
@@ -78,6 +79,31 @@ public class GoogleCloudStorageService {
      * the repository name.
      */
     private volatile Map<String, Storage> clientCache = emptyMap();
+
+    private volatile GoogleCloudStorageAsyncService asyncService;
+
+    void setAsyncService(GoogleCloudStorageAsyncService service) {
+        this.asyncService = Objects.requireNonNull(service);
+    }
+
+    GoogleCloudStorageAsyncService asyncService() {
+        return Objects.requireNonNull(asyncService, "GCS async service is not initialized");
+    }
+
+    void closeAsyncService() {
+        GoogleCloudStorageAsyncService service = asyncService;
+        if (service != null) {
+            service.close();
+        }
+    }
+
+    GoogleCloudStorageAsyncClients asyncClients(String clientName) {
+        GoogleCloudStorageClientSettings settings = clientSettings.get(clientName);
+        if (settings == null) {
+            throw new IllegalArgumentException("Unknown GCS client [" + clientName + "]");
+        }
+        return asyncService().client(clientName, settings);
+    }
 
     final private GoogleApplicationDefaultCredentials googleApplicationDefaultCredentials;
 
