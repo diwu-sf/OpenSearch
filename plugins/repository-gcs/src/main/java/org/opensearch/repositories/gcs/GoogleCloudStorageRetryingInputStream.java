@@ -128,6 +128,9 @@ class GoogleCloudStorageRetryingInputStream extends InputStream {
                         return AccessController.doPrivilegedChecked(() -> {
                             final Get get = storage.objects().get(blobId.getBucket(), blobId.getName());
                             get.setReturnRawInputStream(true);
+                            if (blobId.getGeneration() != null) {
+                                get.setGeneration(blobId.getGeneration());
+                            }
 
                             if (currentOffset > 0 || start > 0 || end < Long.MAX_VALUE - 1) {
                                 get.getRequestHeaders().setRange("bytes=" + Math.addExact(start, currentOffset) + "-" + end);
