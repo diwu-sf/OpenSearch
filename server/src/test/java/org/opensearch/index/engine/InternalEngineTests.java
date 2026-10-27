@@ -82,6 +82,7 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHitCountCollector;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.Lock;
 import org.apache.lucene.tests.index.ForceMergePolicy;
 import org.apache.lucene.tests.mockfile.ExtrasFS;
@@ -9058,6 +9059,58 @@ public class InternalEngineTests extends EngineTestCase {
             run.set(false);
             refresher.join();
         }
+    }
+
+    /**
+     * A refresh that runs while a flush's commit is fsyncing opens a reader that carries the commit's new segments version but
+     * the previous commit's generation. Lucene considers that reader current, so the flush's own post-commit refresh used to
+     * keep it, leaving an idle shard's reader naming a segments_N file that the commit replaces.
+     */
+    public void testFlushReopensReaderOpenedWhileCommitIsSyncing() throws Exception {
+        IOUtils.close(store, engine);
+        final AtomicBoolean blockCommitSync = new AtomicBoolean();
+        final CountDownLatch commitSyncing = new CountDownLatch(1);
+        final CountDownLatch releaseCommitSync = new CountDownLatch(1);
+        final Directory directory = new FilterDirectory(newFSDirectory(createTempDir())) {
+            @Override
+            public void sync(Collection<String> names) throws IOException {
+                // IndexWriter writes pending_segments_N under its monitor, then syncs the commit's other files without it.
+                if (names.stream().noneMatch(name -> name.startsWith("pending_segments")) && blockCommitSync.compareAndSet(true, false)) {
+                    commitSyncing.countDown();
+                    try {
+                        releaseCommitSync.await();
+                    } catch (InterruptedException e) {
+                        throw new AssertionError(e);
+                    }
+                }
+                super.sync(names);
+            }
+        };
+        store = createStore(directory);
+        engine = createEngine(store, createTempDir());
+        for (int i = 0; i < 10; i++) {
+            engine.index(indexForDoc(createParsedDoc(Integer.toString(i), null)));
+        }
+        engine.flush(true, true);
+
+        blockCommitSync.set(true);
+        final Thread flusher = new Thread(() -> engine.flush(true, true));
+        flusher.start();
+        try {
+            assertTrue(commitSyncing.await(30, TimeUnit.SECONDS));
+            engine.refresh("concurrent with commit");
+        } finally {
+            releaseCommitSync.countDown();
+            flusher.join();
+        }
+
+        try (
+            GatedCloseable<SegmentInfos> snapshot = engine.getSegmentInfosSnapshot();
+            GatedCloseable<IndexCommit> lastCommit = engine.acquireLastIndexCommit(false)
+        ) {
+            assertEquals(lastCommit.get().getSegmentsFileName(), snapshot.get().getSegmentsFileName());
+        }
+        getSnapshotAndAssertFilesExistLocally();
     }
 
     private void getSnapshotAndAssertFilesExistLocally() throws IOException {

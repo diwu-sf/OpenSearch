@@ -65,6 +65,7 @@ import org.apache.lucene.store.LockObtainFailedException;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchException;
+import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.concurrent.GatedCloseable;
@@ -656,11 +657,15 @@ public class InternalEngine extends Engine {
         try {
             try {
                 // We always open reader on parent IndexWriter.
-                final OpenSearchDirectoryReader directoryReader = OpenSearchDirectoryReader.wrap(
+                final CheckedSupplier<OpenSearchDirectoryReader, IOException> openReader = () -> OpenSearchDirectoryReader.wrap(
                     DirectoryReader.open(documentIndexWriter.getAccumulatingIndexWriter()),
                     shardId
                 );
-                internalReaderManager = new OpenSearchReaderManager(directoryReader);
+                internalReaderManager = new OpenSearchReaderManager(
+                    openReader.get(),
+                    combinedDeletionPolicy::getLastCommitGeneration,
+                    openReader
+                );
                 lastCommittedSegmentInfos = store.readLastCommittedSegmentsInfo();
                 ExternalReaderManager externalReaderManager = new ExternalReaderManager(internalReaderManager, externalRefreshListener);
                 success = true;

@@ -24,6 +24,7 @@ import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.UploadListener;
+import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.DataFormatAwareEngine;
@@ -42,10 +43,14 @@ import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 import org.opensearch.indices.replication.checkpoint.SegmentReplicationCheckpointPublisher;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.file.NoSuchFileException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -98,6 +103,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
     private final SegmentReplicationCheckpointPublisher checkpointPublisher;
     private final RemoteStoreSettings remoteStoreSettings;
     private final RemoteStoreUploader remoteStoreUploader;
+    private final AtomicBoolean refreshForMissingFilesPending = new AtomicBoolean();
 
     public RemoteStoreRefreshListener(
         IndexShard indexShard,
@@ -308,6 +314,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                     // move.
                     long lastRefreshedCheckpoint = indexShard.getIndexer().lastRefreshedCheckpoint();
                     Collection<String> localSegmentsPostRefresh = catalogSnapshot.getFiles(true);
+                    ensureFilesToUploadExistLocally(localSegmentsPostRefresh);
 
                     evictUploadedChecksums(localSegmentsPostRefresh);
                     // Create a map of file name to size and update the refresh segment tracker
@@ -580,6 +587,63 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
 
     boolean isLowPriorityUpload() {
         return isLocalOrSnapshotRecoveryOrSeeding();
+    }
+
+    /**
+     * Fails the sync if the catalog snapshot names a file that would be uploaded but is missing on disk, such as the
+     * segments_N file of a commit that a later commit has replaced. Retrying the same snapshot would fail the same way every
+     * time, so this also requests a refresh, which opens a reader on the latest commit.
+     *
+     * @param files the files of the catalog snapshot being synced
+     * @throws NoSuchFileException if any file to upload is missing locally
+     */
+    private void ensureFilesToUploadExistLocally(Collection<String> files) throws IOException {
+        final List<String> missingFiles = new ArrayList<>();
+        for (String file : files) {
+            if (EXCLUDE_FILES.contains(file) || remoteDirectory.isMergedSegmentPendingDownload(file)) {
+                continue;
+            }
+            try {
+                storeDirectory.fileLength(file);
+            } catch (NoSuchFileException | FileNotFoundException e) {
+                // Use the same check as the upload: a file of the same name in the remote store is only skipped if its checksum
+                // matches the local file's, which can't be read once the file is gone unless it was cached earlier.
+                if (skipUpload(file) == false) {
+                    missingFiles.add(file);
+                }
+            }
+        }
+        if (missingFiles.isEmpty() == false) {
+            requestRefreshForMissingFiles();
+            throw new NoSuchFileException("files " + missingFiles + " of the catalog snapshot are missing locally");
+        }
+    }
+
+    private void requestRefreshForMissingFiles() {
+        if (refreshForMissingFilesPending.compareAndSet(false, true) == false) {
+            return;
+        }
+        // Refresh on another thread: this sync may itself be running inside a refresh, as a refresh listener.
+        indexShard.getThreadPool().executor(ThreadPool.Names.REFRESH).execute(new AbstractRunnable() {
+            @Override
+            protected void doRun() {
+                indexShard.refresh("remote store missing files");
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                if (shardClosed()) {
+                    logger.debug("Failed to refresh for missing segment files on a closed shard", e);
+                } else {
+                    logger.warn("Failed to refresh for missing segment files", e);
+                }
+            }
+
+            @Override
+            public void onAfter() {
+                refreshForMissingFilesPending.set(false);
+            }
+        });
     }
 
     /**
