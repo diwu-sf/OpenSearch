@@ -13,6 +13,8 @@ import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.tests.store.BaseDirectoryWrapper;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
@@ -53,6 +55,9 @@ import org.opensearch.threadpool.ThreadPool;
 import org.junit.After;
 
 import java.io.IOException;
+import java.nio.file.NoSuchFileException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -70,7 +75,9 @@ import static org.opensearch.test.RemoteStoreTestUtils.createMetadataFileBytes;
 import static org.opensearch.test.RemoteStoreTestUtils.getDummyMetadata;
 import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
@@ -163,6 +170,93 @@ public class RemoteStoreRefreshListenerTests extends IndexShardTestCase {
 
         verify(owningShard, atLeastOnce()).isRemoteStoreFenceSuperseded();
         verify(owningShard, atLeastOnce()).getRemoteStoreSettings();
+    }
+
+    /**
+     * A catalog snapshot that names a file missing both locally and remotely, like the segments_N file of a replaced commit,
+     * can never be uploaded. The sync fails without trying to upload it and requests a refresh, so that the next attempt
+     * syncs a reader on the latest commit rather than the same snapshot.
+     */
+    public void testSyncRequestsRefreshWhenSnapshotNamesMissingFile() throws Exception {
+        setup(true, 3);
+        IndexShard staleShard = spy(indexShard);
+        doAnswer(invocation -> {
+            GatedCloseable<CatalogSnapshot> current = indexShard.getCatalogSnapshot();
+            CatalogSnapshot stale = spy(current.get().clone());
+            Collection<String> files = new ArrayList<>(current.get().getFiles(true));
+            files.add("segments_zz");
+            doReturn(stale).when(stale).clone();
+            doReturn(files).when(stale).getFiles(anyBoolean());
+            return new GatedCloseable<>(stale, current::close);
+        }).when(staleShard).getCatalogSnapshot();
+        CountDownLatch refreshRequested = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            refreshRequested.countDown();
+            return null;
+        }).when(staleShard).refresh(anyString());
+        RemoteSegmentTransferTracker tracker = remoteStoreStatsTrackerFactory.getRemoteSegmentTransferTracker(indexShard.shardId());
+        long uploadsFailed = tracker.getTotalUploadsFailed();
+        long uploadBytesStarted = tracker.getUploadBytesStarted();
+
+        RemoteStoreRefreshListener listener = newRefreshListenerFor(staleShard);
+        listener.afterRefresh(true);
+
+        assertTrue(refreshRequested.await(30, TimeUnit.SECONDS));
+        assertTrue(tracker.getTotalUploadsFailed() > uploadsFailed);
+        assertEquals(uploadBytesStarted, tracker.getUploadBytesStarted());
+        listener.drainRefreshes();
+    }
+
+    /**
+     * A file that was uploaded before a restart is listed in the remote store, but its local checksum is not cached yet. If
+     * the file is then deleted locally, the upload can't tell that the remote copy matches and tries to upload it again,
+     * so the sync must also request a refresh in that case.
+     */
+    public void testSyncRequestsRefreshWhenUploadedFileIsMissingAndItsChecksumIsNotCached() throws Exception {
+        setup(true, 3);
+        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploaded =
+            ((RemoteSegmentStoreDirectory) ((FilterDirectory) ((FilterDirectory) indexShard.remoteStore().directory()).getDelegate())
+                .getDelegate()).getSegmentsUploadedToRemoteStore();
+        String missingFile;
+        try (GatedCloseable<CatalogSnapshot> snapshot = indexShard.getCatalogSnapshot()) {
+            missingFile = snapshot.get().getFiles(true).stream().filter(uploaded::containsKey).findFirst().orElseThrow();
+        }
+        Directory directory = new FilterDirectory(indexShard.store().directory()) {
+            @Override
+            public long fileLength(String name) throws IOException {
+                if (name.equals(missingFile)) {
+                    throw new NoSuchFileException(name);
+                }
+                return super.fileLength(name);
+            }
+
+            @Override
+            public IndexInput openInput(String name, IOContext context) throws IOException {
+                if (name.equals(missingFile)) {
+                    throw new NoSuchFileException(name);
+                }
+                return super.openInput(name, context);
+            }
+        };
+        Store store = spy(indexShard.store());
+        doReturn(directory).when(store).directory();
+        IndexShard shard = spy(indexShard);
+        doReturn(store).when(shard).store();
+        CountDownLatch refreshRequested = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            refreshRequested.countDown();
+            return null;
+        }).when(shard).refresh(anyString());
+        RemoteSegmentTransferTracker tracker = remoteStoreStatsTrackerFactory.getRemoteSegmentTransferTracker(indexShard.shardId());
+        long uploadBytesStarted = tracker.getUploadBytesStarted();
+
+        // A new listener starts with no cached checksums, like after a restart.
+        RemoteStoreRefreshListener listener = newRefreshListenerFor(shard);
+        listener.afterRefresh(true);
+
+        assertTrue(refreshRequested.await(30, TimeUnit.SECONDS));
+        assertEquals(uploadBytesStarted, tracker.getUploadBytesStarted());
+        listener.drainRefreshes();
     }
 
     /**
