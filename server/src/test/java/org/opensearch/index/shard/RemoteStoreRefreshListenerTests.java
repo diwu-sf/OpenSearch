@@ -173,6 +173,28 @@ public class RemoteStoreRefreshListenerTests extends IndexShardTestCase {
     }
 
     /**
+     * A recovering remote store primary force-flushes as it starts. The flush has to run once the shard is in primary mode:
+     * before that the upload it triggers is skipped and left to a retry, by which time the flush no longer holds the commit.
+     */
+    public void testStartedPrimaryHasUploadedItsStartupCommit() throws IOException {
+        indexShard = newStartedShard(
+            true,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_REMOTE_STORE_ENABLED, true)
+                .put(IndexMetadata.SETTING_REMOTE_SEGMENT_STORE_REPOSITORY, "temp-fs")
+                .put(IndexMetadata.SETTING_REMOTE_TRANSLOG_STORE_REPOSITORY, "temp-fs")
+                .put(SETTING_REPLICATION_TYPE, ReplicationType.SEGMENT)
+                .build(),
+            new EngineBackedIndexerFactory(new InternalEngineFactory())
+        );
+        RemoteSegmentStoreDirectory remoteSegmentStoreDirectory =
+            (RemoteSegmentStoreDirectory) ((FilterDirectory) ((FilterDirectory) indexShard.remoteStore().directory()).getDelegate())
+                .getDelegate();
+        String lastCommit = SegmentInfos.getLastCommitSegmentsFileName(indexShard.store().directory());
+        assertTrue(remoteSegmentStoreDirectory.getSegmentsUploadedToRemoteStore().containsKey(lastCommit));
+    }
+
+    /**
      * A catalog snapshot that names a file missing both locally and remotely, like the segments_N file of a replaced commit,
      * can never be uploaded. The sync fails without trying to upload it and requests a refresh, so that the next attempt
      * syncs a reader on the latest commit rather than the same snapshot.

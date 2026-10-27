@@ -828,6 +828,12 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                 replicationTracker.updateFromClusterManager(applyingClusterStateVersion, inSyncAllocationIds, routingTable);
             }
 
+            final boolean activatesPrimaryMode = newRouting.primary()
+                && newPrimaryTerm == pendingPrimaryTerm
+                && currentRouting.initializing()
+                && currentRouting.isRelocationTarget() == false
+                && newRouting.active();
+            boolean flushInPrimaryMode = false;
             if (state == IndexShardState.POST_RECOVERY && newRouting.active()) {
                 assert currentRouting.active() == false : "we are in POST_RECOVERY, but our shard routing is active " + currentRouting;
                 assert currentRouting.isRelocationTarget() == false
@@ -838,9 +844,14 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                 changeState(IndexShardState.STARTED, "global state is [" + newRouting.state() + "]");
 
                 // Flush here after relocation of primary, so that replica get all changes from new primary rather than waiting for more
-                // docs to get indexed.
+                // docs to get indexed. A recovering primary flushes below instead, once it is in primary mode: a remote store
+                // primary only uploads segments in primary mode, so a flush before that leaves its new commit to a retry.
                 if (indexSettings.isSegRepEnabledOrRemoteNode()) {
-                    flush(new FlushRequest().waitIfOngoing(true).force(true));
+                    if (activatesPrimaryMode) {
+                        flushInPrimaryMode = true;
+                    } else {
+                        flush(new FlushRequest().waitIfOngoing(true).force(true));
+                    }
                 }
             } else if (currentRouting.primary()
                 && currentRouting.relocating()
@@ -861,7 +872,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
             if (newRouting.primary()) {
                 if (newPrimaryTerm == pendingPrimaryTerm) {
-                    if (currentRouting.initializing() && currentRouting.isRelocationTarget() == false && newRouting.active()) {
+                    if (activatesPrimaryMode) {
                         // Refresh the primary operation policy in case it has changed since the start of recovery.
                         // No primary-origin operation can have run yet, so this is safe without blocking operations.
                         getIndexer().refreshPrimaryOperationPolicy();
@@ -876,6 +887,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                         } else {
                             replicationTracker.resetHasAllPeerRecoveryRetentionLeases();
                             ensurePeerRecoveryRetentionLeasesExist();
+                        }
+                        if (flushInPrimaryMode) {
+                            flush(new FlushRequest().waitIfOngoing(true).force(true));
                         }
                     }
                 } else {
