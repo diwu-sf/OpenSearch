@@ -165,6 +165,14 @@ public class CombinedDeletionPolicy extends IndexDeletionPolicy {
     }
 
     /**
+     * Returns the generation of the most recent commit point, or -1 if the index writer has not opened yet.
+     */
+    long getLastCommitGeneration() {
+        final IndexCommit commit = lastCommit;
+        return commit == null ? -1 : commit.getGeneration();
+    }
+
+    /**
      * Captures the most recent commit point {@link #lastCommit} or the most recent safe commit point {@link #safeCommit}.
      * Index files of the capturing commit point won't be released until the commit reference is closed.
      *

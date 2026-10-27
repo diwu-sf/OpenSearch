@@ -33,12 +33,16 @@
 package org.opensearch.index.engine;
 
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FilterDirectoryReader;
+import org.apache.lucene.index.StandardDirectoryReader;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.search.SearcherManager;
+import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 
 import java.io.IOException;
+import java.util.function.LongSupplier;
 
 /**
  * Utility class to safely share {@link OpenSearchDirectoryReader} instances across
@@ -51,6 +55,9 @@ import java.io.IOException;
  */
 @SuppressForbidden(reason = "reference counting is required here")
 class OpenSearchReaderManager extends ReferenceManager<OpenSearchDirectoryReader> {
+    private final LongSupplier lastCommitGeneration;
+    private final CheckedSupplier<OpenSearchDirectoryReader, IOException> openReader;
+
     /**
      * Creates and returns a new OpenSearchReaderManager from the given
      * already-opened {@link OpenSearchDirectoryReader}, stealing
@@ -59,7 +66,25 @@ class OpenSearchReaderManager extends ReferenceManager<OpenSearchDirectoryReader
      * @param reader            the directoryReader to use for future reopens
      */
     OpenSearchReaderManager(OpenSearchDirectoryReader reader) {
+        this(reader, () -> -1, null);
+    }
+
+    /**
+     * Creates a manager for near-real-time readers of an index writer, which also reopens a reader that names an older commit
+     * than the writer's latest one.
+     *
+     * @param reader               the directoryReader to use for future reopens
+     * @param lastCommitGeneration the generation of the index writer's latest commit
+     * @param openReader           opens a new near-real-time reader on the index writer
+     */
+    OpenSearchReaderManager(
+        OpenSearchDirectoryReader reader,
+        LongSupplier lastCommitGeneration,
+        CheckedSupplier<OpenSearchDirectoryReader, IOException> openReader
+    ) {
         this.current = reader;
+        this.lastCommitGeneration = lastCommitGeneration;
+        this.openReader = openReader;
     }
 
     @Override
@@ -70,7 +95,19 @@ class OpenSearchReaderManager extends ReferenceManager<OpenSearchDirectoryReader
     @Override
     protected OpenSearchDirectoryReader refreshIfNeeded(OpenSearchDirectoryReader referenceToRefresh) throws IOException {
         final OpenSearchDirectoryReader reader = (OpenSearchDirectoryReader) DirectoryReader.openIfChanged(referenceToRefresh);
+        if (reader == null && namesOlderCommit(referenceToRefresh)) {
+            // IndexWriter#commit advances the segments version before it syncs the commit's files, and the generation only
+            // after. A reader opened in between has the new version with the previous generation, so Lucene considers it
+            // current, yet it names a segments_N file that the commit replaces and may delete. Open a reader on the new commit.
+            return openReader.get();
+        }
         return reader;
+    }
+
+    private boolean namesOlderCommit(OpenSearchDirectoryReader reader) {
+        return openReader != null
+            && FilterDirectoryReader.unwrap(reader) instanceof StandardDirectoryReader standardReader
+            && standardReader.getSegmentInfos().getLastGeneration() < lastCommitGeneration.getAsLong();
     }
 
     @Override
